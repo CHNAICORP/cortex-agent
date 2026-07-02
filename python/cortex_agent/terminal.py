@@ -127,7 +127,7 @@ class Terminal:
         mode_color = {"standard": self.GREEN, "auto-edit": self.YELLOW, "yolo": self.RED}.get(mode, self.GRAY)
         mode_icon = {"standard": "🛡️", "auto-edit": "✏️", "yolo": "⚠️"}.get(mode, "?")
         self._w(f"\n{self.CYAN}{'='*48}{self.RESET}\n")
-        self._w(f"  Cortex Agent  {self.GREEN}{model}{self.RESET}  {self.GRAY}{tools} tools{self.RESET}\n")
+        self._w(f"  Cortex Agent  {self.GREEN}{model}{self.RESET}  {self.GRAY}{tools} tools  🐍 Python{self.RESET}\n")
         self._w(f"  权限: {mode_color}{mode_icon} {mode}{self.RESET}  {self.GRAY}(Shift+Tab 切换){self.RESET}\n")
         if session_id:
             self._w(f"  Session: {self.GRAY}{session_id}{self.RESET}\n")
