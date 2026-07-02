@@ -58,6 +58,7 @@ def main():
         except: pass
 
     p = argparse.ArgumentParser(description="Cortex Agent")
+    p.add_argument("-V", "--version", action="store_true", help="显示版本号")
     p.add_argument("--model", default=None, help="模型别名 (覆盖 settings.json)")
     p.add_argument("--work-dir", default=None, help="工作目录")
     p.add_argument("--max-steps", type=int, default=10)
@@ -70,6 +71,10 @@ def main():
     p.add_argument("--mode", default=None, choices=["standard","auto-edit","yolo"],
                    help="权限模式: standard|auto-edit|yolo")
     args = p.parse_args()
+
+    if args.version:
+        print(f"cortx {__import__('cortex_agent').__version__} (Python)")
+        return
 
     if args.init_config:
         cfg_path = os.path.join(os.getcwd(), ".cortex", "settings.json")

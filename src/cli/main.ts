@@ -40,6 +40,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args.includes("--version") || args.includes("-V")) {
+    const pkg = require("../../package.json");
+    console.log(`cortx ${pkg.version} (TypeScript/Node ${process.version})`);
+    return;
+  }
+
   await loadTools();
 
   const settings = loadSettings();
