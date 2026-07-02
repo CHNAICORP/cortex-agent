@@ -39,12 +39,3 @@ registry.register(
     }
   },
 );
-
-registry.register(
-  "获取当前系统日期时间",
-  RiskLevel.SAFE, Capability.FS_READ,
-  { workDir: "string" },
-  function get_current_time(): string {
-    return new Date().toLocaleString("zh-CN");
-  },
-);

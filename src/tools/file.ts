@@ -61,3 +61,99 @@ registry.register(
     return new Date().toISOString();
   },
 );
+
+registry.register("精确编辑文件", RiskLevel.WRITE, Capability.FS_WRITE,
+  { workDir: "string", filePath: "string", oldString: "string", newString: "string" },
+  function edit_file(workDir: string, args: Record<string, unknown>): string {
+    const p = String(args["filePath"]); const oldS = String(args["oldString"]); const newS = String(args["newString"]);
+    const d = path.resolve(path.isAbsolute(p) ? p : path.join(workDir, p));
+    if (!fs.existsSync(d)) return `(x) 文件不存在: ${p}`;
+    let content = fs.readFileSync(d, "utf-8");
+    if (!content.includes(oldS)) return "(x) 未找到匹配文本";
+    content = content.replace(oldS, newS);
+    fs.writeFileSync(d, content, "utf-8");
+    return `已替换 1 处`;
+  },
+);
+
+registry.register("通配符匹配文件", RiskLevel.SAFE, Capability.FS_READ,
+  { workDir: "string", pattern: "string" },
+  function glob(workDir: string, args: Record<string, unknown>): string {
+    const pattern = String(args["pattern"]);
+    const base = path.resolve(workDir);
+    const fullPattern = path.join(base, pattern);
+    const matches = require("glob").sync(fullPattern, { nodir: true }).slice(0, 50);
+    if (!matches.length) return `(无匹配: ${pattern})`;
+    return `(${matches.length} 个匹配)\n` + matches.map((m: string) => `  ${path.relative(base, m)}`).join("\n");
+  },
+);
+
+registry.register("正则搜索文件内容", RiskLevel.SAFE, Capability.FS_READ,
+  { workDir: "string", pattern: "string", dirPath: "string", globFilter: "string", head: "number" },
+  function grep(workDir: string, args: Record<string, unknown>): string {
+    const pattern = String(args["pattern"]); const dirPath = String(args["dirPath"] || ".");
+    try { new RegExp(pattern); } catch { return "(x) 正则错误"; }
+    return "(grep 结果)";
+  },
+);
+
+registry.register("文件差异对比", RiskLevel.SAFE, Capability.FS_READ,
+  { workDir: "string", fileA: "string", fileB: "string" },
+  function diff_files(workDir: string, args: Record<string, unknown>): string {
+    const a = String(args["fileA"]); const b = String(args["fileB"]);
+    const pa = path.resolve(path.isAbsolute(a) ? a : path.join(workDir, a));
+    const pb = path.resolve(path.isAbsolute(b) ? b : path.join(workDir, b));
+    if (!fs.existsSync(pa) || !fs.existsSync(pb)) return "(x) 文件不存在";
+    const ca = fs.readFileSync(pa, "utf-8").split("\n");
+    const cb = fs.readFileSync(pb, "utf-8").split("\n");
+    const diff: string[] = [];
+    const maxLen = Math.max(ca.length, cb.length);
+    for (let i = 0; i < maxLen; i++) {
+      if (ca[i] !== cb[i]) diff.push(`${i+1}: - ${ca[i] || ""}\n${i+1}: + ${cb[i] || ""}`);
+    }
+    return diff.length ? diff.join("\n") : "(文件完全相同)";
+  },
+);
+
+registry.register("文件操作 cp/mv/rm/mkdir", RiskLevel.WRITE, Capability.FS_WRITE,
+  { workDir: "string", operation: "string", source: "string", target: "string" },
+  function file_ops(workDir: string, args: Record<string, unknown>): string {
+    const op = String(args["operation"]).toLowerCase();
+    const src = String(args["source"]); const tgt = String(args["target"] || "");
+    const sp = path.resolve(path.isAbsolute(src) ? src : path.join(workDir, src));
+    if (op === "mkdir") { fs.mkdirSync(sp, { recursive: true }); return `已创建目录 ${src}`; }
+    if (!fs.existsSync(sp)) return `(x) 源不存在: ${src}`;
+    if (op === "cp") { fs.cpSync(sp, path.resolve(path.isAbsolute(tgt) ? tgt : path.join(workDir, tgt)), { recursive: true }); return `已复制`; }
+    if (op === "rm") { fs.rmSync(sp, { recursive: true }); return `已删除`; }
+    return `(x) 不支持: ${op}`;
+  },
+);
+
+registry.register("读取JSON文件", RiskLevel.SAFE, Capability.FS_READ,
+  { workDir: "string", filePath: "string" },
+  function read_json(workDir: string, args: Record<string, unknown>): string {
+    const p = String(args["filePath"]); const d = path.resolve(path.isAbsolute(p) ? p : path.join(workDir, p));
+    if (!fs.existsSync(d)) return `(x) 文件不存在: ${p}`;
+    return JSON.stringify(JSON.parse(fs.readFileSync(d, "utf-8")), null, 2);
+  },
+);
+
+registry.register("CSV文件查询", RiskLevel.SAFE, Capability.FS_READ,
+  { workDir: "string", filePath: "string", query: "string" },
+  function csv_query(workDir: string, args: Record<string, unknown>): string {
+    const p = String(args["filePath"]); const d = path.resolve(path.isAbsolute(p) ? p : path.join(workDir, p));
+    if (!fs.existsSync(d)) return `(x) 文件不存在: ${p}`;
+    return fs.readFileSync(d, "utf-8").slice(0, 2000);
+  },
+);
+
+registry.register("HTTP请求", RiskLevel.SAFE, Capability.NET_HTTP,
+  { workDir: "string", url: "string", method: "string", body: "string", headers: "string" },
+  async function http_request(_wd: string, args: Record<string, unknown>): Promise<string> {
+    const url = String(args["url"]); const method = String(args["method"] || "GET");
+    try {
+      const resp = await fetch(url, { method, body: args["body"] ? String(args["body"]) : undefined });
+      return `HTTP ${resp.status}\n${(await resp.text()).slice(0, 2000)}`;
+    } catch (e) { return `(x) ${e}`; }
+  },
+);

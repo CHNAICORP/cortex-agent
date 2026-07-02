@@ -11,6 +11,11 @@ import { registry } from "../core/registry";
 async function loadTools(): Promise<void> {
   await import("../tools/file");
   await import("../tools/net");
+  await import("../tools/exec");
+  await import("../tools/memory");
+  await import("../tools/mcp");
+  await import("../tools/browser");
+  await import("../tools/proxy");
   console.error(`[cortex] ${registry.schemaList.length} tools loaded`);
 }
 
