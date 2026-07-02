@@ -162,6 +162,14 @@ def create_default_settings(path: str) -> dict:
                 "models": {"flash": "deepseek-v4-flash", "pro": "deepseek-v4-pro"},
             }
         },
+        "web_search": {
+            "provider": "duckduckgo",       # duckduckgo | brave | serpapi | tavily
+            "brave_api_key": "",             # Brave Search API key (https://brave.com/search/api/)
+            "serpapi_api_key": "",           # SerpAPI key (https://serpapi.com/)
+            "tavily_api_key": "",            # Tavily API key (https://tavily.com/)
+            "max_results": 5,
+            "timeout": 10,
+        },
         "max_steps": 10,
         "loop_timeout": 120,
         "think_timeout": 60,

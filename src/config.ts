@@ -44,6 +44,14 @@ export function loadSettings(): Settings {
     const template: Record<string, unknown> = {
       model: "pro", provider: "deepseek",
       providers: { deepseek: { api_key: "", base_url: "https://api.deepseek.com/v1", models: { flash: "deepseek-v4-flash", pro: "deepseek-v4-pro" } } },
+      web_search: {
+        provider: "duckduckgo",          // duckduckgo | brave | serpapi | tavily
+        brave_api_key: "",
+        serpapi_api_key: "",
+        tavily_api_key: "",
+        max_results: 5,
+        timeout: 10,
+      },
       max_steps: 10, context_limit: 1000000, permission_mode: "standard",
       auto_extract_memory: true, memory_enabled: true, sessions_enabled: true,
     };
