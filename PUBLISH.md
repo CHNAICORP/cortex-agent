@@ -199,4 +199,4 @@ name = "ctx-xxx"
 
 ### Q: 如何撤回错误版本？
 - PyPI: `twine upload --skip-existing` 重新构建不同版本
-- npm: `npm unpublish ctx@1.0.0`（72小时内）
+- npm: `npm unpublish @chnaicorp/ctx@1.0.0`（72小时内）
