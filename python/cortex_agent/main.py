@@ -137,8 +137,7 @@ def main():
     if args.update:
         import subprocess, sys as _sys
         print(f"当前: cortx {__import__('cortex_agent').__version__}")
-        print("正在更新...")
-        _sys.exit(subprocess.call([_sys.executable, "-m", "pip", "install", "cortx", "--upgrade"]))
+        _sys.exit(subprocess.call([_sys.executable, "-m", "pip", "install", "cortx", "--upgrade", "--no-cache-dir"]))
 
     if args.init_config:
         cfg_path = os.path.join(os.getcwd(), ".cortx", "settings.json")
