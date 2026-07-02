@@ -167,19 +167,19 @@ async function main(): Promise<void> {
       console.log(`\n  → ${modeNames[next]}`);
       rl.write(null as unknown as string, { ctrl: true, name: "u" }); // clear line
       showPrompt();
-      rl.showPrompt();
+      rl.prompt();
     }
   });
 
   console.log("Cortex Agent REPL — /help /exit\n");
   showPrompt();
-  rl.showPrompt();
+  rl.prompt();
 
   for await (const line of rl) {
     const q = line.trim();
-    if (!q) { showPrompt(); rl.showPrompt(); continue; }
+    if (!q) { showPrompt(); rl.prompt(); continue; }
     if (["/exit", "/quit", "/q"].includes(q)) break;
-    if (["/help", "/h"].includes(q)) { console.log(USAGE); showPrompt(); rl.showPrompt(); continue; }
+    if (["/help", "/h"].includes(q)) { console.log(USAGE); showPrompt(); rl.prompt(); continue; }
 
     try {
       const answer = await agent.run(q);
@@ -188,7 +188,7 @@ async function main(): Promise<void> {
       console.error(`[ERROR] ${e}`);
     }
     showPrompt();
-    rl.showPrompt();
+    rl.prompt();
   }
   console.log("Bye.");
   rl.close();
