@@ -66,7 +66,7 @@ async function main(): Promise<void> {
   if (!hasApiKey) {
     const noStream = process.argv.includes("--no-stream");
     if (noStream) {
-      console.error("\n  ⚠️  未配置 API Key。交互模式运行 ctx 进入配置向导，或编辑 ~/.cortex/settings.json\n");
+      console.error("\n  ⚠️  未配置 API Key。交互模式运行 ctx 进入配置向导，或编辑 ~/.cortx/settings.json\n");
       process.exit(1);
     }
     // Interactive setup wizard

@@ -1,5 +1,5 @@
 /**
- * 配置加载器 — 读取 .cortex/settings.json
+ * 配置加载器 — 读取 .cortx/settings.json
  */
 import * as fs from "fs";
 import * as path from "path";
