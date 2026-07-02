@@ -4,6 +4,9 @@
  * 与 Python main.py 完全对应
  */
 import * as readline from "readline";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
 import { CortexAgent, LLMProvider } from '../core/loop.js';
 import { registry } from '../core/registry.js';
 import { loadSettings, getApiKey, getBaseUrl } from '../config.js';
@@ -55,9 +58,58 @@ async function main(): Promise<void> {
     return;
   }
 
-  await loadTools();
-
+  // 首次运行配置向导
   const settings = loadSettings();
+  const provider = (settings.provider as string) || "deepseek";
+  const providers = (settings.providers || {}) as Record<string, Record<string, unknown>>;
+  const hasApiKey = (providers[provider]?.api_key as string) || (settings.apiKey as string) || "";
+  if (!hasApiKey) {
+    const noStream = process.argv.includes("--no-stream");
+    if (noStream) {
+      console.error("\n  ⚠️  未配置 API Key。交互模式运行 ctx 进入配置向导，或编辑 ~/.cortex/settings.json\n");
+      process.exit(1);
+    }
+    // Interactive setup wizard
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const ask = (q: string): Promise<string> => new Promise(r => rl.question(q, r));
+    console.log(`\n  ${"=".repeat(50)}`);
+    console.log(`    🎉 欢迎使用 Cortx！`);
+    console.log(`    这是第一次运行，需要配置 AI 模型。`);
+    console.log(`  ${"=".repeat(50)}\n`);
+    console.log(`    选择模型提供商:`);
+    console.log(`      [1] DeepSeek (推荐，国内可用)`);
+    console.log(`      [2] OpenAI`);
+    const choice = (await ask(`    请选择 (1/2): `)).trim() || "1";
+    const prov = choice === "2" ? "openai" : "deepseek";
+    console.log(`\n    输入 API Key:`);
+    console.log(`    (DeepSeek: https://platform.deepseek.com/api_keys)`);
+    let apiKey = (await ask(`    API Key: `)).trim();
+    while (!apiKey) { apiKey = (await ask(`    API Key (不能为空): `)).trim(); }
+    console.log(`\n    选择模型:`);
+    const models = prov === "openai" ? { "1": ["gpt-4o", "gpt-4o"], "2": ["gpt-4o-mini", "gpt-4o-mini"] }
+      : { "1": ["pro", "deepseek-v4-pro"], "2": ["flash", "deepseek-v4-flash"] };
+    for (const [k, [alias, name]] of Object.entries(models)) {
+      console.log(`      [${k}] ${alias} (${name})`);
+    }
+    const mChoice = (await ask(`    请选择 (1/2): `)).trim() || "1";
+    const [modelAlias, modelName] = models[mChoice] || models["1"];
+    rl.close();
+    // Save
+    const userPath = path.join(os.homedir(), ".cortex", "settings.json");
+    const newSettings = {
+      model: modelAlias, provider: prov,
+      providers: { [prov]: { api_key: apiKey, base_url: `https://api.${prov}.com/v1`, models: { [modelAlias]: modelName } } },
+      max_steps: 10, context_limit: 1000000, permission_mode: "standard",
+      auto_extract_memory: true, memory_enabled: true, sessions_enabled: true,
+    };
+    fs.mkdirSync(path.dirname(userPath), { recursive: true });
+    fs.writeFileSync(userPath, JSON.stringify(newSettings, null, 2), "utf-8");
+    console.log(`\n    ✅ 配置已保存到 ${userPath}\n`);
+    // Reload settings
+    Object.assign(settings, newSettings);
+  }
+
+  await loadTools();
   const modelIdx = args.indexOf("--model");
   const model = modelIdx >= 0 ? (args[modelIdx + 1] || "pro") : (settings.model || "pro");
   const queryIdx = args.indexOf("-q");
