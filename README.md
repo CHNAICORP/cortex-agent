@@ -18,20 +18,23 @@
 | 位置 | `python/cortex_agent/` | `src/` |
 | 工具数 | 43 | 43 |
 | 安装 | `pip install cortex-agent` | `npm install -g cortex-agent` |
-| CLI 命令 | `ctx` | `ctx` |
+| CLI 命令 | `ctx` (仅 3 字母 👑) | `ctx` |
+
+> 💡 **包名 `cortex-agent` 用于 PyPI/npm 搜索发现，日常使用仅需 `ctx`** — 对比 `claude`(6字母) / `codex`(5字母)
 
 ---
 
 ## 快速开始
 
 ```bash
-# Python
-pip install cortex-agent
-ctx --model pro
+# 一行安装
+pip install cortex-agent    # Python
+npm install -g cortex-agent # TypeScript
 
-# TypeScript
-npm install -g cortex-agent
-ctx --model pro
+# 一行启动
+ctx                         # 交互 REPL
+ctx -q "hello"              # 单次查询
+ctx --model pro             # 指定模型
 
 # 单次查询
 ctx -q "用 Python 写斐波那契函数"
