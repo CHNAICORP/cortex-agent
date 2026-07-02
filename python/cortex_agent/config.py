@@ -73,6 +73,33 @@ def load_settings(project_dir: str = None) -> dict:
         except Exception:
             pass
 
+    # 4. 首次运行：如果没有任何配置，自动创建全局模板
+    if not merged and not os.environ.get("CORTEX_API_KEY"):
+        os.makedirs(os.path.dirname(user), exist_ok=True)
+        template = {
+            "model": "pro",
+            "provider": "deepseek",
+            "providers": {
+                "deepseek": {
+                    "api_key": "",
+                    "base_url": "https://api.deepseek.com/v1",
+                    "models": {"flash": "deepseek-v4-flash", "pro": "deepseek-v4-pro"}
+                }
+            },
+            "max_steps": 10,
+            "context_limit": 1000000,
+            "permission_mode": "standard",
+            "auto_extract_memory": True,
+            "memory_enabled": True,
+            "sessions_enabled": True,
+        }
+        with open(user, "w", encoding="utf-8") as f:
+            json.dump(template, f, ensure_ascii=False, indent=2)
+        print(f"\n  📝 首次运行: 已创建全局配置 {user}")
+        print(f"  ⚙️  请在 providers.deepseek.api_key 填入你的 API Key")
+        print(f"  📖 同时也支持项目级配置: .cortex/settings.json\n")
+        merged.update(template)
+
     # 3. 环境变量覆盖
     if os.environ.get("CORTEX_API_KEY"):
         merged.setdefault("providers", {})
