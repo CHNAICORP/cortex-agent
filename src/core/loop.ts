@@ -201,6 +201,12 @@ export class CortexAgent {
   private suspendedCaps = new Set<Capability>();
   private permissionDecisions = new Map<string, boolean>();
   private sessionId: string | null = null;
+  private term: { thinkToken: (t: string) => void; answerToken: (t: string) => void; 
+                  toolStart: (n: string, a: Record<string,unknown>) => void;
+                  toolDone: (ok: boolean, ms: number, p: string) => void;
+                  closeThinking: () => void; nextRound: () => void } | null = null;
+
+  setTerm(t: typeof this.term) { this.term = t; }
 
   constructor(config: Partial<AgentConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -303,6 +309,8 @@ export class CortexAgent {
         const capStr = meta?.capability || "?";
         const cap = meta?.capability || null;
 
+        if (this.term) this.term.toolStart(tc.name, tc.args);
+
         // Guard
         let ok: boolean;
         let reason: string;
@@ -337,6 +345,7 @@ export class CortexAgent {
         }
 
         const latency = Date.now() - t0;
+        if (this.term) this.term.toolDone(ok, latency, result);
         this.observer.record(this.trace, stepNo, tc.name, tc.args, result, ok, capStr, latency);
         this.ctx.push({ role: "tool", tool_call_id: tc.id, content: result });
       }
@@ -357,6 +366,13 @@ export class CortexAgent {
   private async _think(): Promise<{ text: string | null; toolCalls: ParsedToolCall[] | null; reasoning: string }> {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
+        if (this.term) {
+          this.term.nextRound();
+          const resp = await this.llm.callStream(this.ctx, 
+            (t) => this.term!.thinkToken(t),
+            (t) => this.term!.answerToken(t));
+          return { text: resp.text || null, toolCalls: resp.toolCalls, reasoning: resp.reasoning };
+        }
         const resp = await this.llm.call(this.ctx);
         return { text: resp.text || null, toolCalls: resp.toolCalls, reasoning: resp.reasoning };
       } catch (e) {

@@ -10,6 +10,7 @@ import * as os from "os";
 import { CortexAgent, LLMProvider } from '../core/loop.js';
 import { registry } from '../core/registry.js';
 import { loadSettings, getApiKey, getBaseUrl } from '../config.js';
+import { Terminal } from './terminal.js';
 
 // Register tools (lazy import to avoid circular deps)
 async function loadTools(): Promise<void> {
@@ -128,6 +129,10 @@ async function main(): Promise<void> {
     contextLimit: (settings.context_limit as number) || 1_000_000,
   });
 
+  const term = new Terminal();
+  agent.setTerm(term);
+  term.banner(agent.config.model, registry.schemaList.length, agent.config.workDir, agent.config.permissionMode);
+
   if (query) {
     const answer = await agent.run(query);
     console.log(answer);
@@ -139,22 +144,42 @@ async function main(): Promise<void> {
     return;
   }
 
-  // REPL
+  // REPL with Shift+Tab support
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const prompt = () => {
+  let currentLine = "";
+  
+  const modeLabels: Record<string, string> = { standard: "s", "auto-edit": "a", yolo: "y" };
+  const showPrompt = () => {
     const pct = agent.contextPct;
-    rl.setPrompt(`[s ${pct}%]> `);
+    const ml = modeLabels[agent.config.permissionMode] || "?";
+    rl.setPrompt(`[${ml} ${pct}%]> `);
   };
 
+  // Listen for Shift+Tab (\x1b[Z) to cycle permission mode
+  process.stdin.on("keypress", (_str, key) => {
+    if (key && key.name === "tab" && key.shift) {
+      // Cycle: standard → auto-edit → yolo → standard
+      const modes = ["standard", "auto-edit", "yolo"];
+      const idx = modes.indexOf(agent.config.permissionMode);
+      const next = modes[(idx + 1) % 3] as "standard" | "auto-edit" | "yolo";
+      agent.config.permissionMode = next;
+      const modeNames: Record<string, string> = { standard: "standard", "auto-edit": "auto-edit", yolo: "yolo" };
+      console.log(`\n  → ${modeNames[next]}`);
+      rl.write(null as unknown as string, { ctrl: true, name: "u" }); // clear line
+      showPrompt();
+      rl.showPrompt();
+    }
+  });
+
   console.log("Cortex Agent REPL — /help /exit\n");
-  prompt();
-  rl.prompt();
+  showPrompt();
+  rl.showPrompt();
 
   for await (const line of rl) {
     const q = line.trim();
-    if (!q) { prompt(); rl.prompt(); continue; }
+    if (!q) { showPrompt(); rl.showPrompt(); continue; }
     if (["/exit", "/quit", "/q"].includes(q)) break;
-    if (["/help", "/h"].includes(q)) { console.log(USAGE); prompt(); rl.prompt(); continue; }
+    if (["/help", "/h"].includes(q)) { console.log(USAGE); showPrompt(); rl.showPrompt(); continue; }
 
     try {
       const answer = await agent.run(q);
@@ -162,8 +187,8 @@ async function main(): Promise<void> {
     } catch (e) {
       console.error(`[ERROR] ${e}`);
     }
-    prompt();
-    rl.prompt();
+    showPrompt();
+    rl.showPrompt();
   }
   console.log("Bye.");
   rl.close();
