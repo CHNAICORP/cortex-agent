@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=75", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "cortex-agent"
@@ -43,5 +43,6 @@ ctx = "main:main"
 py-modules = [
     "config", "cortex_agent", "llm", "main", "memory",
     "policy", "skills", "terminal",
-    "tools", "tools_browser", "tools_computer", "tools_mcp", "tools_network"
+    "tools", "tools_browser", "tools_computer", "tools_mcp", "tools_network",
+    "tools_rag"
 ]
