@@ -38,6 +38,15 @@ import os, json
 from typing import Optional
 
 
+def _smart_merge(base: dict, override: dict):
+    """智能合并：override 中的非空值覆盖 base，空值不覆盖。"""
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _smart_merge(base[k], v)
+        elif v not in (None, "", 0, [], {}):
+            base[k] = v
+
+
 def _find_upwards(filename: str, start: str = None) -> Optional[str]:
     """从 start 向上搜索 filename，返回完整路径或 None。"""
     d = os.path.abspath(start or os.getcwd())
@@ -64,12 +73,13 @@ def load_settings(project_dir: str = None) -> dict:
         except Exception:
             pass
 
-    # 2. 用户级 (~)
+    # 2. 用户级 (~) — 智能合并：非空值覆盖，空值不覆盖
     user = os.path.join(os.path.expanduser("~"), ".cortex", "settings.json")
     if os.path.isfile(user):
         try:
             with open(user, "r", encoding="utf-8") as f:
-                merged.update(json.load(f))
+                user_settings = json.load(f)
+            _smart_merge(merged, user_settings)
         except Exception:
             pass
 
