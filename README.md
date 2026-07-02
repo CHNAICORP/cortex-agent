@@ -8,6 +8,8 @@
 
 Cortex Agent 是一个从零构建的 AI Agent 运行时，零外部 Agent 框架依赖。核心哲学：**给 Agent 工具和安全边界，但不替它思考。**
 
+> **Cortex** = 大脑皮层。如同大脑皮层负责感知推理、血脑屏障严格过滤、海马体持久记忆 — Cortex Agent 将 Agentic Loop（推理）、PolicyEngine（安全）、Memory（记忆）融为一体，是 Harness Agent 架构范式的具体实现。
+
 ---
 
 ## 设计哲学

@@ -1,5 +1,20 @@
 # Cortex Agent — Harness Agent 架构 + Agentic Loop 运行时
 
+## 命名由来
+
+**Cortex** = 大脑皮层 — 负责感知、推理、决策。Cortex Agent 不是简单的工具调用链，而是**有安全边界、有记忆、能反思的自主推理层**。
+
+```
+大脑架构                     Cortex Agent
+────────                   ────────────
+大脑皮层 → 感知·推理·决策    Agentic Loop (Think→Guard→Act→Reflect)
+血脑屏障 → 严格过滤          PolicyEngine (完整中介·4级审计)
+海马体   → 长期记忆          Memory + Sessions (跨会话持久化)
+运动皮层 → 动作输出          41 工具 (文件/Shell/浏览器/MCP...)
+```
+
+**Cortex** 是 **Harness Agent** 架构范式的具体实现，如同 Ubuntu 之于 Linux。
+
 ## 设计哲学
 
 **Harness Agent** 是一套安全可控的 AI Agent 运行时框架。
