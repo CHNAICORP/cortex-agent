@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "cortex-agent"
+version = "1.0.0"
+description = "安全可控的 AI Agent 运行时框架 — Harness Agent 架构 + Agentic Loop 引擎"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Cortex Agent Contributors"}
+]
+keywords = ["ai-agent", "llm", "agent-framework", "harness", "agentic-loop", "mcp", "browser-automation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio",
+]
+
+[project.scripts]
+cortex-agent = "main:main"
+
+[tool.setuptools]
+py-modules = [
+    "config", "cortex_agent", "llm", "main", "memory",
+    "policy", "skills", "terminal",
+    "tools", "tools_browser", "tools_computer", "tools_mcp", "tools_network"
+]

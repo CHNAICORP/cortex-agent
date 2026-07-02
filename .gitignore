@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Agent workspace (runtime outputs)
+cortex_workspace/*
+!cortex_workspace/.gitkeep
+
+# Test artifacts
+*.png
+*.txt
+*.go
+!requirements.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets
+.cortex/settings.json
+
+# Sessions + Goal (runtime)
+.cortex/sessions/*.jsonl
+!.cortex/sessions/last_session.txt
+.cortex/GOAL.txt
+.cortex/memory.md
+
+# MCP runtime
+.playwright-mcp/
+
+# OS
+.DS_Store
+Thumbs.db
