@@ -204,8 +204,15 @@ export class CortexAgent {
 
   constructor(config: Partial<AgentConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
-    const wd = path.resolve(this.config.workDir);
-    fs.mkdirSync(wd, { recursive: true });
+    let wd = path.resolve(this.config.workDir);
+    try {
+      fs.mkdirSync(wd, { recursive: true });
+    } catch (e) {
+      // 回退到用户目录
+      wd = path.resolve(os.homedir(), '.cortx', 'workspace');
+      fs.mkdirSync(wd, { recursive: true });
+      this.config.workDir = wd;
+    }
 
     this.policy = new PolicyEngine(wd, { permissionMode: this.config.permissionMode });
     this.executor = new ToolExecutor(wd, this.config.toolTimeout);

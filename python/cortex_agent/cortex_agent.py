@@ -367,8 +367,14 @@ class CortexAgent:
     def __init__(self, config: AgentConfig = None):
         self.config = config or AgentConfig()
         wd = os.path.realpath(self.config.work_dir)
-        os.makedirs(wd, exist_ok=True)
-        with open(os.path.join(wd, '.gitkeep'), 'w') as f: f.write('')
+        try:
+            os.makedirs(wd, exist_ok=True)
+            with open(os.path.join(wd, '.gitkeep'), 'w') as f: f.write('')
+        except PermissionError:
+            # 回退到用户目录
+            wd = os.path.realpath(os.path.join(os.path.expanduser('~'), '.cortx', 'workspace'))
+            os.makedirs(wd, exist_ok=True)
+            self.config.work_dir = wd
         self.policy = PolicyEngine(wd, self.config)
         self.executor = ToolExecutor(registry, wd, self.config.tool_timeout)
         # ── Runtime state (工作区 = 运行时产物) ──
