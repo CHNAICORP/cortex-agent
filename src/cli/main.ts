@@ -88,11 +88,12 @@ async function main(): Promise<void> {
     console.log(`\n    选择模型:`);
     const models = prov === "openai" ? { "1": ["gpt-4o", "gpt-4o"], "2": ["gpt-4o-mini", "gpt-4o-mini"] }
       : { "1": ["pro", "deepseek-v4-pro"], "2": ["flash", "deepseek-v4-flash"] };
-    for (const [k, [alias, name]] of Object.entries(models)) {
-      console.log(`      [${k}] ${alias} (${name})`);
+    const modelsMap: Record<string, string[]> = models;
+    for (const [k, v] of Object.entries(modelsMap)) {
+      console.log(`      [${k}] ${v[0]} (${v[1]})`);
     }
     const mChoice = (await ask(`    请选择 (1/2): `)).trim() || "1";
-    const [modelAlias, modelName] = models[mChoice] || models["1"];
+    const [modelAlias, modelName] = modelsMap[mChoice] || modelsMap["1"];
     rl.close();
     // Save
     const userPath = path.join(os.homedir(), ".cortex", "settings.json");
