@@ -2,47 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Build & Publish
+## Critical Rule: Dual-Language Sync
 
-```bash
-# TypeScript — compile to dist/
-npx tsc --outDir dist
+**Python and TypeScript are two independent implementations that must stay in sync.** Every change to one must be ported to the other.
 
-# Python — build wheel
-python -m build --wheel
-# -> dist/cortx-<version>-py3-none-any.whl
-
-# Publish (requires tokens)
-twine upload dist/cortx-<version>-py3-none-any.whl
-npm publish --access public
-```
-
-## Version bump checklist
-
-When bumping versions, update these **4 files in lockstep**:
-
-- `pyproject.toml` → `project.version`
-- `python/cortex_agent/__init__.py` → `__version__`
-- `package.json` → `version`
-- Run `npx tsc --outDir dist` before npm publish (auto-run via `prepublishOnly`)
-
-## Architecture: Harness Agent
-
-The repo contains **two independent implementations** of the same agent runtime — Python and TypeScript — sharing identical design but no shared code.
-
-### Agentic Loop (4-phase, same in both)
-
-```
-Think (LLM streaming with reasoning) → Guard (PolicyEngine audit) → Act (ToolExecutor) → Reflect (step limit / convergence)
-```
-
-The LLM receives all 43 tool schemas as `tools` parameter. It autonomously picks which tool to call based on descriptions. The harness never injects behavioral instructions — it only provides tools and enforces safety boundaries.
-
-### Key files (Python → TS mapping)
-
-| Concept | Python | TypeScript |
-|---------|--------|------------|
-| Agentic Loop engine | `python/cortex_agent/cortex_agent.py` (~740 lines) | `src/core/loop.ts` |
+| Layer | Python | TypeScript |
+|-------|--------|------------|
+| Agentic Loop engine | `python/cortex_agent/cortex_agent.py` | `src/core/loop.ts` |
 | Tool registry + schema gen | `cortex_agent.py` → `ToolRegistry` class | `src/core/registry.ts` |
 | PolicyEngine (security auditor) | `python/cortex_agent/policy.py` | `src/core/policy.ts` |
 | LLM provider | `python/cortex_agent/llm.py` | `src/core/llm.ts` |
@@ -56,6 +22,57 @@ The LLM receives all 43 tool schemas as `tools` parameter. It autonomously picks
 | Config loader (settings.json) | `python/cortex_agent/config.py` | `src/config.ts` |
 | Skills system | `python/cortex_agent/skills.py` | (not yet in TS) |
 | Core types/enums | `cortex_agent.py` → `RiskLevel`/`Capability`/etc. | `src/core/types.ts` |
+
+### Development workflow
+
+```
+1. Make changes to Python code
+2. Port the same changes to TypeScript code (or vice versa)
+3. Build & Test both locally:
+   npx tsc --outDir dist          # TypeScript — must compile with 0 errors
+   python -c "import sys;sys.path.insert(0,'python');import cortex_agent.tools"  # Python — must import clean
+4. Run agent end-to-end tests (use --mode auto-edit):
+   # Python
+   python -c "import sys;sys.path.insert(0,'python');from cortex_agent.main import main;..." -q "test query"
+   # TypeScript (requires proxy if behind firewall)
+   ctx --no-stream --mode auto-edit -q "test query"
+5. When both pass → version bump → git commit + tag → publish
+```
+
+### Version bump checklist
+
+Update these **4 files in lockstep**:
+
+- `pyproject.toml` → `project.version`
+- `python/cortex_agent/__init__.py` → `__version__`
+- `package.json` → `version`
+- Run `npx tsc --outDir dist` before npm publish (auto-run via `prepublishOnly`)
+
+### Publish
+
+```bash
+# Python
+python -m build --wheel
+twine upload dist/cortx-<version>-py3-none-any.whl
+
+# TypeScript
+npm publish --access public
+
+# Git
+git add -A && git commit -m "🔖 vX.Y.Z — <summary>" && git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin main --tags
+```
+
+## Architecture: Harness Agent
+
+The repo contains **two independent implementations** of the same agent runtime — Python and TypeScript — sharing identical design but no shared code.
+
+### Agentic Loop (4-phase, same in both)
+
+```
+Think (LLM streaming with reasoning) → Guard (PolicyEngine audit) → Act (ToolExecutor) → Reflect (step limit / convergence)
+```
+
+The LLM receives all 43 tool schemas as `tools` parameter. It autonomously picks which tool to call based on descriptions. The harness never injects behavioral instructions — it only provides tools and enforces safety boundaries.
 
 ### Tool registration pattern
 
