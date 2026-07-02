@@ -100,11 +100,11 @@ cortex_workspace/             — Agent 运行时工作区
 
 ```bash
 # Python
-pip install cortex-agent
+pip install ctx
 ctx --model pro
 
 # TypeScript
-npm install -g cortex-agent
+npm install -g @chnaicorp/ctx
 ctx --model pro
 
 # REPL 命令

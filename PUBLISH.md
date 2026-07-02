@@ -4,12 +4,13 @@
 
 | | 包名 | CLI 命令 | 原因 |
 |---|------|---------|------|
-| PyPI | `ctx` | `ctx` | 包名描述性强（搜索引擎友好），CLI 短（对比 `claude` 6 字母 / `codex` 5 字母 / `ctx` 3 字母） |
-| npm | `ctx` | `ctx` | 同上 |
+| PyPI | `ctx` | `ctx` | PyPI `ctx` 可用 |
+| npm | `@chnaicorp/ctx` | `ctx` | npm `ctx` 被占，用 scoped 包 |
 
 ```bash
-pip install ctx   # 安装
-ctx                        # 运行（仅 3 字母）
+pip install ctx                    # Python
+npm install -g @chnaicorp/ctx      # TypeScript
+ctx                                # 运行（仅 3 字母）
 ```
 
 ---
@@ -92,7 +93,7 @@ npm publish
 ### 2.3 验证安装
 
 ```bash
-npm install -g ctx
+npm install -g @chnaicorp/ctx
 ctx --no-stream -q "hello"
 ```
 
@@ -133,7 +134,7 @@ npx tsc && npm publish
 
 # 4. 验证
 pip install --upgrade ctx && ctx --version
-npm install -g ctx@latest && ctx --version
+npm install -g @chnaicorp/ctx@latest && ctx --version
 ```
 
 ### 3.3 版本号规范 (SemVer)
