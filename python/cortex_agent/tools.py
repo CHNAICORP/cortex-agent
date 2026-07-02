@@ -266,7 +266,7 @@ def web_fetch(work_dir: str, url: str) -> str:
 def _get_memory_store(work_dir: str):
     try: from .memory import MemoryStore
     except ImportError: return None
-    from . from . import cortex_agent as ca
+    from . import cortex_agent as ca
     memory_path = getattr(ca, '_project_memory_path', None)
     if not memory_path:
         memory_path = os.path.join(os.path.dirname(os.path.abspath(work_dir)), '.cortex', 'memory.md')

@@ -3,7 +3,11 @@
   "version": "1.0.0",
   "type": "commonjs",
   "description": "AI Agent runtime — Harness Agent architecture + Agentic Loop engine",
-  "homepage": "https://github.com/<user>/cortex-agent#readme",
+  "homepage": "https://github.com/CHNAICORP/cortex-agent#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CHNAICORP/cortex-agent.git"
+  },
   "license": "MIT",
   "keywords": [
     "ai-agent",
