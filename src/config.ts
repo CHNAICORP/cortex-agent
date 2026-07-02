@@ -39,6 +39,20 @@ export function loadSettings(): Settings {
   if (fs.existsSync(user)) {
     try { Object.assign(merged, JSON.parse(fs.readFileSync(user, "utf-8"))); } catch { /* ignore */ }
   }
+  // 3. 首次运行自动创建全局配置
+  if (Object.keys(merged).length === 0 && !process.env.CORTEX_API_KEY) {
+    const template: Record<string, unknown> = {
+      model: "pro", provider: "deepseek",
+      providers: { deepseek: { api_key: "", base_url: "https://api.deepseek.com/v1", models: { flash: "deepseek-v4-flash", pro: "deepseek-v4-pro" } } },
+      max_steps: 10, context_limit: 1000000, permission_mode: "standard",
+      auto_extract_memory: true, memory_enabled: true, sessions_enabled: true,
+    };
+    fs.mkdirSync(path.dirname(user), { recursive: true });
+    fs.writeFileSync(user, JSON.stringify(template, null, 2), "utf-8");
+    console.error(`\n  📝 首次运行: 已创建全局配置 ${user}`);
+    console.error(`  ⚙️  请在 providers.deepseek.api_key 填入你的 API Key\n`);
+    Object.assign(merged, template);
+  }
   // 3. Env override
   if (process.env.CORTEX_API_KEY) {
     const provider = (merged.provider as string) || "deepseek";
