@@ -4,11 +4,24 @@
 import { registry } from '../core/registry.js';
 import { RiskLevel, Capability } from '../core/types.js';
 
+// 获取系统代理配置
+function getProxyAgent(): { dispatcher?: unknown } {
+  const httpProxy = process.env.HTTP_PROXY || process.env.http_proxy;
+  const httpsProxy = process.env.HTTPS_PROXY || process.env.https_proxy || httpProxy;
+  if (httpsProxy) {
+    try {
+      const { ProxyAgent } = require('undici');
+      return { dispatcher: new ProxyAgent(httpsProxy) };
+    } catch { /* undici not available */ }
+  }
+  return {};
+}
+
 registry.register(
   "联网搜索网页",
   RiskLevel.SAFE, Capability.NET_SEARCH,
   { workDir: "string", query: "string" },
-  async function web_search(workDir: string, args: Record<string, unknown>): Promise<string> {
+  async function web_search(_workDir: string, args: Record<string, unknown>): Promise<string> {
     const query = String(args["query"]);
     try {
       const url = `https://lite.duckduckgo.com/lite/`;
@@ -19,6 +32,7 @@ registry.register(
           "User-Agent": "Mozilla/5.0 (compatible; CortexAgent/1.0)",
         },
         body: new URLSearchParams({ q: query }).toString(),
+        ...getProxyAgent(),
       });
       const html = await resp.text();
       const results: string[] = [];
@@ -51,6 +65,7 @@ registry.register(
       const resp = await fetch(url, {
         headers: { "User-Agent": "Mozilla/5.0 (compatible; CortexAgent/1.0)" },
         signal: AbortSignal.timeout(8000),
+        ...getProxyAgent(),
       });
       const html = await resp.text();
       // Simple HTML → text
