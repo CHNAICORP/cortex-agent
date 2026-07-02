@@ -53,9 +53,11 @@ async function main(): Promise<void> {
   if (args.includes("--update")) {
     const pkg = require("../../package.json");
     console.log(`当前: cortx ${pkg.version} (TypeScript)`);
-    console.log("更新: npm install -g @chnaicorp/cortx@latest");
     const { execSync } = require("child_process");
-    execSync("npm install -g @chnaicorp/cortx@latest", { stdio: "inherit" });
+    // --force 跳过缓存，确保安装最新版本
+    execSync("npm uninstall -g @chnaicorp/cortx", { stdio: "ignore" });
+    execSync("npm cache clean --force", { stdio: "ignore" });
+    execSync("npm install -g @chnaicorp/cortx@latest --force", { stdio: "inherit" });
     return;
   }
 

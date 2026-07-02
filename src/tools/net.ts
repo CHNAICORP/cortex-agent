@@ -5,18 +5,16 @@ import { registry } from '../core/registry.js';
 import { RiskLevel, Capability } from '../core/types.js';
 
 // 获取系统代理配置
-function getProxyAgent(): { dispatcher?: unknown } {
-  const httpProxy = process.env.HTTP_PROXY || process.env.http_proxy;
-  const httpsProxy = process.env.HTTPS_PROXY || process.env.https_proxy || httpProxy;
-  if (httpsProxy) {
-    try {
-      const { ProxyAgent } = require('undici');
-      return { dispatcher: new ProxyAgent(httpsProxy) };
-    } catch { /* undici not available */ }
-  }
-  return {};
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function getProxyAgent(): Record<string, unknown> {
+  const proxy = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy;
+  if (!proxy) return {};
+  try {
+    // undici is built into Node.js (used by fetch internally)
+    const { ProxyAgent } = require('undici') as Record<string, any>;
+    return { dispatcher: new ProxyAgent(proxy) };
+  } catch { return {}; }
 }
-
 registry.register(
   "联网搜索网页",
   RiskLevel.SAFE, Capability.NET_SEARCH,
@@ -85,3 +83,4 @@ registry.register(
     }
   },
 );
+// 简化代理类型
