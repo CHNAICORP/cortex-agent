@@ -96,7 +96,7 @@ async function main(): Promise<void> {
     const [modelAlias, modelName] = modelsMap[mChoice] || modelsMap["1"];
     rl.close();
     // Save
-    const userPath = path.join(os.homedir(), ".cortex", "settings.json");
+    const userPath = path.join(os.homedir(), ".cortx", "settings.json");
     const newSettings = {
       model: modelAlias, provider: prov,
       providers: { [prov]: { api_key: apiKey, base_url: `https://api.${prov}.com/v1`, models: { [modelAlias]: modelName } } },

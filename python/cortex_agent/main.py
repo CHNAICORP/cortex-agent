@@ -86,7 +86,7 @@ def setup_wizard(config: 'AgentConfig', settings: dict) -> 'AgentConfig':
     model_alias, model_name = models.get(provider, {}).get(m_choice, ("pro", "deepseek-v4-pro"))
 
     # 4. Save
-    user_path = os.path.join(os.path.expanduser("~"), ".cortex", "settings.json")
+    user_path = os.path.join(os.path.expanduser("~"), ".cortx", "settings.json")
     new_settings = {
         "model": model_alias,
         "provider": provider,
@@ -141,7 +141,7 @@ def main():
         _sys.exit(subprocess.call([_sys.executable, "-m", "pip", "install", "cortx", "--upgrade"]))
 
     if args.init_config:
-        cfg_path = os.path.join(os.getcwd(), ".cortex", "settings.json")
+        cfg_path = os.path.join(os.getcwd(), ".cortx", "settings.json")
         create_default_settings(cfg_path)
         print(f"已创建默认配置: {cfg_path}")
         return

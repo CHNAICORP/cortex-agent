@@ -389,7 +389,7 @@ class CortexAgent:
         self.sessions = mem_module.SessionStore(sessions_dir) if self.config.sessions_enabled else None
         # 技能/配置 → .cortex/ (项目配置, Git 追踪)
         from . import skills as _skills
-        skills_dir = self.config.skills_dir or os.path.join(cwd, '.cortex', 'skills')
+        skills_dir = self.config.skills_dir or os.path.join(cwd, '.cortx', 'skills')
         self.skill_mgr = _skills.SkillManager()
         self.skill_mgr.SKILLS_DIR = skills_dir
         self.skill_mgr.reload()

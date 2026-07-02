@@ -61,7 +61,7 @@ registry.register("工具描述", RiskLevel.SAFE, Capability.FS_READ,
 
 ## 添加自定义技能
 
-在 `.cortex/skills/` 创建 `.md` 文件：
+在 `.cortx/skills/` 创建 `.md` 文件：
 
 ```markdown
 # Skill Name

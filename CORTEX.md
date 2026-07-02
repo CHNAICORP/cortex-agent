@@ -72,7 +72,7 @@ src/                          # TypeScript 包
 └── cli/                      — CLI 入口
 
 cortex_workspace/             — Agent 运行时工作区
-.cortex/                      — 项目配置 (settings.json + skills/)
+.cortx/                      — 项目配置 (settings.json + skills/)
 ```
 
 ## 43 个工具

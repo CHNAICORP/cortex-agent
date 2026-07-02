@@ -269,7 +269,7 @@ def _get_memory_store(work_dir: str):
     from . import cortex_agent as ca
     memory_path = getattr(ca, '_project_memory_path', None)
     if not memory_path:
-        memory_path = os.path.join(os.path.dirname(os.path.abspath(work_dir)), '.cortex', 'memory.md')
+        memory_path = os.path.join(os.path.dirname(os.path.abspath(work_dir)), '.cortx', 'memory.md')
     return MemoryStore(memory_path)
 
 

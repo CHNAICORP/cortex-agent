@@ -34,7 +34,7 @@ class Skill:
 class SkillManager:
     """技能管理器 — 加载/列表/调用"""
     
-    SKILLS_DIR = ".cortex/skills"
+    SKILLS_DIR = ".cortx/skills"
 
     def __init__(self, project_dir: str = None):
         self.project_dir = project_dir or os.getcwd()

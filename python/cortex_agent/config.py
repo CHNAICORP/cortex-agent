@@ -65,7 +65,7 @@ def load_settings(project_dir: str = None) -> dict:
     merged = {}
 
     # 1. 项目级
-    proj = _find_upwards(".cortex/settings.json", project_dir or os.getcwd())
+    proj = _find_upwards(".cortx/settings.json", project_dir or os.getcwd())
     if proj:
         try:
             with open(proj, "r", encoding="utf-8") as f:
@@ -74,7 +74,7 @@ def load_settings(project_dir: str = None) -> dict:
             pass
 
     # 2. 用户级 (~) — 智能合并：非空值覆盖，空值不覆盖
-    user = os.path.join(os.path.expanduser("~"), ".cortex", "settings.json")
+    user = os.path.join(os.path.expanduser("~"), ".cortx", "settings.json")
     if os.path.isfile(user):
         try:
             with open(user, "r", encoding="utf-8") as f:

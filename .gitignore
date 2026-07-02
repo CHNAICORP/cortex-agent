@@ -23,7 +23,7 @@ cortex_workspace/*
 *.swo
 
 # Secrets
-.cortex/settings.json
+.cortx/settings.json
 
 # MCP runtime
 .playwright-mcp/

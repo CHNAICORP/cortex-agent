@@ -30,12 +30,12 @@ export interface Settings {
 export function loadSettings(): Settings {
   const merged: Record<string, unknown> = {};
   // 1. Project-level
-  const proj = findUpwards(".cortex/settings.json", process.cwd());
+  const proj = findUpwards(".cortx/settings.json", process.cwd());
   if (proj) {
     try { Object.assign(merged, JSON.parse(fs.readFileSync(proj, "utf-8"))); } catch { /* ignore */ }
   }
   // 2. User-level
-  const user = path.join(process.env.HOME || process.env.USERPROFILE || "~", ".cortex", "settings.json");
+  const user = path.join(process.env.HOME || process.env.USERPROFILE || "~", ".cortx", "settings.json");
   if (fs.existsSync(user)) {
     try { Object.assign(merged, JSON.parse(fs.readFileSync(user, "utf-8"))); } catch { /* ignore */ }
   }
