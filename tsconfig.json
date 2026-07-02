@@ -1,6 +1,6 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
+    "target": "ES2024",
     "module": "commonjs",
     "moduleResolution": "node10",
     "outDir": "./dist",
@@ -13,6 +13,7 @@
     "declaration": true,
     "sourceMap": true,
     "types": ["node"],
+    "lib": ["ES2024"],
     "ignoreDeprecations": "6.0"
   },
   "include": ["src/**/*.ts"],

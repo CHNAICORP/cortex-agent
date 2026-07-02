@@ -106,22 +106,24 @@ export class LLMProvider {
       signal: AbortSignal.timeout(this.timeout * 1000),
     });
 
-    const data = await resp.json();
+    const data: Record<string, unknown> = await resp.json() as Record<string, unknown>;
     this.callCount++;
     if (data.usage) {
-      this.totalInputTokens += data.usage.prompt_tokens || 0;
-      const cached = data.usage.prompt_tokens_details?.cached_tokens || 0;
+      const usage = data.usage as Record<string, unknown>;
+      this.totalInputTokens += (usage.prompt_tokens as number) || 0;
+      const details = usage.prompt_tokens_details as Record<string, unknown> | undefined;
+      const cached = (details?.cached_tokens as number) || 0;
       this.totalCachedTokens += cached;
       if (cached > 0) this.cacheHits++;
     }
 
-    const msg = data.choices?.[0]?.message;
-    const text: string = msg?.content || "";
-    const reasoning: string = msg?.reasoning_content || "";
+    const msg = (data.choices as Array<{ message?: Record<string, unknown> }>)?.[0]?.message;
+    const text: string = (msg?.content as string) || "";
+    const reasoning: string = (msg?.reasoning_content as string) || "";
 
     let toolCalls: ParsedToolCall[] | null = null;
     if (msg?.tool_calls) {
-      toolCalls = msg.tool_calls.map((tc: { id: string; function: { name: string; arguments: string } }) => ({
+      toolCalls = (msg.tool_calls as Array<{ id: string; function: { name: string; arguments: string } }>).map(tc => ({
         id: tc.id,
         name: tc.function.name,
         args: JSON.parse(tc.function.arguments || "{}"),
