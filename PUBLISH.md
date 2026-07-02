@@ -88,8 +88,8 @@ npm pack --dry-run
 npm login
 # 输入用户名/密码/邮箱
 
-# 发布
-npm publish
+# 发布（scoped 包必须加 --access public，否则报 402 Payment Required）
+npm publish --access public
 ```
 
 ### 2.3 验证安装
@@ -134,7 +134,7 @@ rm -rf dist && python -m build
 twine upload dist/*
 
 # 3. npm
-npx tsc && npm publish
+npx tsc && npm publish --access public
 
 # 4. 验证
 pip install --upgrade ctx && ctx --version
@@ -177,7 +177,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: '22' }
-      - run: npm ci && npx tsc && npm publish
+      - run: npm ci && npx tsc && npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 ```
