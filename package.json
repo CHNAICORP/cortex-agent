@@ -1,12 +1,12 @@
 {
-  "name": "@chnaicorp/ctx",
+  "name": "cortx",
   "version": "1.0.0",
   "type": "commonjs",
   "description": "AI Agent runtime — Harness Agent architecture + Agentic Loop engine",
-  "homepage": "https://github.com/CHNAICORP/cortex-agent#readme",
+  "homepage": "https://github.com/CHNAICORP/ctx#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/CHNAICORP/cortex-agent.git"
+    "url": "git+https://github.com/CHNAICORP/ctx.git"
   },
   "license": "MIT",
   "keywords": [
@@ -19,7 +19,7 @@
     "cli"
   ],
   "bin": {
-    "cortex-agent": "./dist/cli/main.js",
+    "ctx": "./dist/cli/main.js",
     "ctx": "./dist/cli/main.js"
   },
   "scripts": {
@@ -35,7 +35,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/<user>/cortex-agent.git"
+    "url": "git+https://github.com/<user>/ctx.git"
   },
   "devDependencies": {
     "@types/node": "^26.1.0",

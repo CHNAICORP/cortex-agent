@@ -5,8 +5,8 @@
 ## 开发环境
 
 ```bash
-git clone https://github.com/CHNAICORP/cortex-agent.git
-cd cortex-agent
+git clone https://github.com/CHNAICORP/cortx.git
+cd cortx
 
 # Python
 pip install -e .

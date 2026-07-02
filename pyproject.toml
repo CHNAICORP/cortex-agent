@@ -3,7 +3,7 @@ requires = ["setuptools>=75", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ctx"
+name = "cortx"
 version = "1.0.0"
 description = "安全可控的 AI Agent 运行时框架 — Harness Agent 架构 + Agentic Loop 引擎"
 readme = "README.md"

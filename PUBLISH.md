@@ -7,11 +7,11 @@
 | | 包名 | CLI 命令 | 原因 |
 |---|------|---------|------|
 | PyPI | `ctx` | `ctx` | PyPI `ctx` 可用 |
-| npm | `@chnaicorp/ctx` | `ctx` | npm `ctx` 被占，用 scoped 包 |
+| npm | `cortx` | `ctx` | npm `ctx` 被占，用 scoped 包 |
 
 ```bash
-pip install ctx                    # Python
-npm install -g @chnaicorp/ctx      # TypeScript
+pip install cortx                    # Python
+npm install -g cortx      # TypeScript
 ctx                                # 运行（仅 3 字母）
 ```
 
@@ -56,7 +56,7 @@ twine upload dist/*
 ### 1.3 验证安装
 
 ```bash
-pip install ctx
+pip install cortx
 ctx --help
 ctx --no-stream -q "hello"
 ```
@@ -95,7 +95,7 @@ npm publish
 ### 2.3 验证安装
 
 ```bash
-npm install -g @chnaicorp/ctx
+npm install -g cortx
 ctx --no-stream -q "hello"
 ```
 
@@ -138,7 +138,7 @@ npx tsc && npm publish
 
 # 4. 验证
 pip install --upgrade ctx && ctx --version
-npm install -g @chnaicorp/ctx@latest && ctx --version
+npm install -g cortx@latest && ctx --version
 ```
 
 ### 3.3 版本号规范 (SemVer)
@@ -203,4 +203,4 @@ name = "ctx-xxx"
 
 ### Q: 如何撤回错误版本？
 - PyPI: `twine upload --skip-existing` 重新构建不同版本
-- npm: `npm unpublish @chnaicorp/ctx@1.0.0`（72小时内）
+- npm: `npm unpublish cortx@1.0.0`（72小时内）
