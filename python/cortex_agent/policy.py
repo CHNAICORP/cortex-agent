@@ -121,10 +121,17 @@ class PolicyEngine:
                 return AuditVerdict.CONFIRM
             return AuditVerdict.ALLOW
         if risk == RiskLevel.WRITE:
-            if is_outside:
-                return AuditVerdict.CONFIRM
-            return AuditVerdict.ALLOW
+            # 工作区内写操作在所有模式都直接放行
+            if not is_outside:
+                return AuditVerdict.ALLOW
+            # auto-edit 模式工作区外写操作也放行
+            if mode == "auto-edit":
+                return AuditVerdict.ALLOW
+            return AuditVerdict.CONFIRM
         # SYSTEM
+        # auto-edit 模式系统命令自动放行
+        if mode == "auto-edit":
+            return AuditVerdict.ALLOW
         if mode == "standard":
             return AuditVerdict.CONFIRM
         return AuditVerdict.ALLOW

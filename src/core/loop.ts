@@ -321,9 +321,15 @@ export class CortexAgent {
           [ok, reason] = this.policy.audit(tc.name, tc.args);
         }
 
-        // CONFIRM → auto-deny in non-interactive
+        // CONFIRM → auto-allow if permission mode allows (non-interactive bypass)
+        // In yolo/auto-edit mode, CONFIRM becomes ALLOW
+        // In standard mode, CONFIRM stays as auto-deny in non-interactive
         if (!ok && reason === "confirm") {
-          ok = false; reason = "用户拒绝";
+          if (this.config.permissionMode === "yolo" || this.config.permissionMode === "auto-edit") {
+            ok = true; reason = "";
+          } else {
+            ok = false; reason = "用户拒绝";
+          }
         }
 
         // Adaptive guard

@@ -640,10 +640,15 @@ class CortexAgent:
                     ok, reason = False, f"能力 {cap.value} 已被暂停"
                 else:
                     ok, reason = self.policy.audit(name, args)
-                # ── CONFIRM → 等待用户授权 ──
+                # ── CONFIRM → 根据权限模式决定 ──
                 if not ok and reason == "confirm":
-                    ok = self._request_confirmation(name, args, cap_str)
-                    reason = "用户授权" if ok else "用户拒绝"
+                    if self.config.permission_mode in ("yolo", "auto-edit"):
+                        ok = True; reason = ""
+                    elif self._term:
+                        ok = self._request_confirmation(name, args, cap_str)
+                        reason = "用户授权" if ok else "用户拒绝"
+                    else:
+                        ok = False; reason = "用户拒绝"
                 # ── Adaptive Guard: track rejections ──
                 if not ok:
                     if cap and "用户" not in reason:

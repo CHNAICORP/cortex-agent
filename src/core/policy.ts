@@ -119,10 +119,15 @@ export class PolicyEngine {
       return AuditVerdict.ALLOW;
     }
     if (risk === RiskLevel.WRITE) {
-      if (isOutside) return AuditVerdict.CONFIRM;
-      return AuditVerdict.ALLOW;
+      // 工作区内写操作在 auto-edit 和 standard 模式都放行
+      if (!isOutside) return AuditVerdict.ALLOW;
+      // 工作区外的写操作在 auto-edit 模式也放行（agent 可能在项目目录操作）
+      if (mode === "auto-edit") return AuditVerdict.ALLOW;
+      return AuditVerdict.CONFIRM;
     }
     // SYSTEM
+    // auto-edit 模式：系统命令自动放行
+    if (mode === "auto-edit") return AuditVerdict.ALLOW;
     if (mode === "standard") return AuditVerdict.CONFIRM;
     return AuditVerdict.ALLOW;
   }
