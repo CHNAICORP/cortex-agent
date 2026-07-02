@@ -140,7 +140,7 @@ async function main(): Promise<void> {
     apiKey: getApiKey(settings),
     baseUrl: getBaseUrl(settings),
     model: LLMProvider.resolve(model),
-    workDir: (settings.work_dir as string) || "./cortex_workspace",
+    workDir: (settings.work_dir as string) || require("../core/types.js").defaultWorkDir() as string,
     permissionMode,
     contextLimit: (settings.context_limit as number) || 1_000_000,
     memoryEnabled: settings.memory_enabled !== false,

@@ -3,6 +3,8 @@
  * 与 Python cortex_agent.py 完全对应
  */
 
+import { homedir } from "os";
+
 // ── 风险等级 ──
 export enum RiskLevel {
   SAFE = 0,
@@ -129,11 +131,16 @@ export interface AgentConfig {
   contextLimit: number;
 }
 
+export function defaultWorkDir(): string {
+  const { join } = require("path") as typeof import("path");
+  return join(homedir(), ".cortx", "workspace");
+}
+
 export const DEFAULT_CONFIG: AgentConfig = {
   apiKey: "",
   baseUrl: "https://api.deepseek.com/v1",
   model: "deepseek-v4-flash",
-  workDir: "./cortex_workspace",
+  workDir: defaultWorkDir(),
   maxSteps: 10,
   toolTimeout: 10,
   systemPrompt: "",

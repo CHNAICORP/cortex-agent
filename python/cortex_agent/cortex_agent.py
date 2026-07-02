@@ -338,7 +338,7 @@ class AgentConfig:
     api_key: str = ""
     base_url: str = "https://api.deepseek.com/v1"
     model: str = "deepseek-v4-flash"
-    work_dir: str = field(default_factory=lambda: os.path.abspath("./cortex_workspace"))
+    work_dir: str = field(default_factory=lambda: os.path.join(os.path.expanduser("~"), ".cortx", "workspace"))
     max_steps: int = 10
     tool_timeout: int = 10
     system_prompt: str = ""
@@ -370,9 +370,8 @@ class CortexAgent:
         wd = os.path.realpath(self.config.work_dir)
         try:
             os.makedirs(wd, exist_ok=True)
-            with open(os.path.join(wd, '.gitkeep'), 'w') as f: f.write('')
         except PermissionError:
-            # 回退到用户目录
+            # 回退到用户目录下的 workspace
             wd = os.path.realpath(os.path.join(os.path.expanduser('~'), '.cortx', 'workspace'))
             os.makedirs(wd, exist_ok=True)
             self.config.work_dir = wd
