@@ -61,9 +61,10 @@ function httpRequest(url: string, method = 'GET', body?: string, timeout = 10000
     const options: Record<string, unknown> = {
       hostname, port, path, method, timeout,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; CortexAgent/1.0)',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Host': reqUrl.hostname,  // 重要：保留原始 Host
         'Accept': 'text/html,application/json,*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
         ...extraHeaders, // Merge extra headers (e.g., API keys)
       } as Record<string, string>,
     };
@@ -112,6 +113,7 @@ function htmlToText(html: string): string {
     .replace(/<[^>]+>/g, " ")
     .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ")
+    .replace(/&ensp;/g, " ").replace(/&#0183;/g, " • ")
     .replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
   return text;
 }
@@ -231,13 +233,12 @@ registry.register(
       const html = await httpRequest('https://lite.duckduckgo.com/lite/', 'POST', body, 8000);
       const results: string[] = [];
 
-      // Parse <a rel="nofollow" href="...">title</a> + <span class="snippet">...</span>
-      const linkRe = /<a[^>]*?rel=["']nofollow["'][^>]*?href=["']([^"']+)["'][^>]*?>(.*?)<\/a>/gi;
+      // DDG Lite uses various link patterns — try multiple
+      let linkRe = /<a[^>]*?rel=["']nofollow["'][^>]*?href=["']([^"']+)["'][^>]*?>(.*?)<\/a>/gi;
       let match;
       while ((match = linkRe.exec(html)) !== null) {
         const u = match[1], title = match[2].replace(/<[^>]+>/g, '').trim();
         if (!title || u.includes('duckduckgo.com')) continue;
-        // Look for snippet after this link
         const restIdx = match.index + match[0].length;
         const snippetM = /<span[^>]*?class=["']snippet["'][^>]*?>(.*?)<\/span>/i.exec(
           html.slice(restIdx, restIdx + 2000)
@@ -247,6 +248,28 @@ registry.register(
         if (results.length >= maxResults) break;
       }
 
+      // Fallback: DDG Lite simple table format <td><a href="...">title</a></td>
+      if (results.length === 0) {
+        const tdRe = /<td[^>]*>\s*<a[^>]*?href=["']([^"']+)["'][^>]*?>(.*?)<\/a>\s*(.*?)<\/td>/gi;
+        while ((match = tdRe.exec(html)) !== null) {
+          const u = match[1], title = match[2].replace(/<[^>]+>/g, '').trim(), snippet = match[3].replace(/<[^>]+>/g, '').trim();
+          if (!title || u.includes('duckduckgo.com') || u === '/lite/' || u === '/') continue;
+          results.push(`[${results.length + 1}] ${title.slice(0, 120)}\n    URL: ${u}${snippet ? `\n    ${snippet.slice(0, 150)}` : ''}`);
+          if (results.length >= maxResults) break;
+        }
+      }
+
+      // Fallback: any <a href="http..."> in table rows
+      if (results.length === 0) {
+        const aRe = /<a[^>]*?href=["'](https?:\/\/[^"']+)["'][^>]*?>(.*?)<\/a>/gi;
+        while ((match = aRe.exec(html)) !== null) {
+          const u = match[1], title = match[2].replace(/<[^>]+>/g, '').trim();
+          if (!title || u.includes('duckduckgo.com') || u === 'https://lite.duckduckgo.com/lite/') continue;
+          results.push(`[${results.length + 1}] ${title.slice(0, 120)}\n    URL: ${u}`);
+          if (results.length >= maxResults) break;
+        }
+      }
+
       if (results.length > 0) {
         return `搜索 "${query}" (${results.length} 条):\n\n${results.join("\n\n")}`;
       }
@@ -254,7 +277,54 @@ registry.register(
       // Both strategies failed
     }
 
-    return `(未找到与 "${query}" 相关的结果)`;
+    // ── Bing Web Search (final fallback via HTML scraping) ──
+    try {
+      const bingUrl = `https://cn.bing.com/search?q=${encoded}&setlang=zh-cn`;
+      const html = await httpRequest(bingUrl, 'GET', undefined, timeout);
+      const results: string[] = [];
+
+      // Bing: <h2><a href="...">title</a></h2> + <p>snippet</p>
+      const h2Re = /<h2[^>]*>\s*<a[^>]*?href=["']([^"']+)["'][^>]*?>(.*?)<\/a>\s*<\/h2>/gi;
+      let match: RegExpExecArray | null;
+      while ((match = h2Re.exec(html)) !== null) {
+        const u = match[1], title = match[2].replace(/<[^>]+>/g, '').trim().replace(/&amp;/g, '&');
+        if (!title || u.includes('bing.com')) continue;
+        // Look for snippet <p> after this h2
+        const restIdx = match.index + match[0].length;
+        const snippetM = /<p[^>]*>(.*?)<\/p>/i.exec(html.slice(restIdx, restIdx + 2000));
+        const snippet = snippetM ? snippetM[1].replace(/<[^>]+>/g, '').trim().replace(/&ensp;/g, ' ').replace(/&#0183;/g, ' • ') : '';
+        results.push(`[${results.length + 1}] ${title.slice(0, 120)}\n    URL: ${u}${snippet ? `\n    ${snippet.slice(0, 150)}` : ''}`);
+        if (results.length >= maxResults) break;
+      }
+
+      if (results.length > 0) {
+        return `搜索 "${query}" via Bing (${results.length} 条):\n\n${results.join("\n\n")}`;
+      }
+
+      // Fallback: Bing <li class="b_algo"> or cite/url patterns
+      const citeRe = /<cite[^>]*>(.*?)<\/cite>/gi;
+      const urls = new Set<string>();
+      while ((match = citeRe.exec(html)) !== null) {
+        const u = match[1].replace(/<[^>]+>/g, '').trim().replace(/&amp;/g, '&');
+        if (u && u.startsWith('http') && !u.includes('bing.com')) urls.add(u);
+      }
+      if (urls.size > 0) {
+        for (const u of urls) {
+          results.push(`[-] ${u}`);
+          if (results.length >= maxResults) break;
+        }
+        if (results.length > 0) {
+          return `搜索 "${query}" via Bing (URLs only, ${results.length} 条):\n\n${results.join("\n\n")}`;
+        }
+      }
+    } catch {
+      // All search strategies failed
+    }
+
+    return `(未找到与 "${query}" 相关的结果。请尝试:\n`
+      + `1. 使用更通用的搜索词\n`
+      + `2. 在 settings.json 中配置 web_search.provider 为 brave/serpapi/tavily 并填入 API key\n`
+      + `3. 检查网络连接是否正常)`;
   },
 );
 
@@ -264,7 +334,6 @@ async function apiGet(url: string, extraHeaders: Record<string, string>, timeout
 }
 
 async function apiPost(url: string, body: string, timeout: number): Promise<string> {
-  // Use httpRequest via POST — Tavily accepts x-www-form-urlencoded too
   return httpRequest(url, 'POST', body, timeout);
 }
 
@@ -279,8 +348,12 @@ registry.register(
     try {
       const html = await httpRequest(url, 'GET', undefined, 10000);
       let text = htmlToText(html);
-      // Trim to 3KB to prevent context explosion from multiple fetches
-      if (text.length > 3000) text = text.slice(0, 3000) + `\n\n[...已截断，原文 ${text.length} 字符]`;
+      // Compress aggressively: remove repeated whitespace and boilerplate
+      text = text
+        .replace(/\n{2,}/g, "\n\n")  // collapse multiple blank lines
+        .replace(/[ \t]{2,}/g, " "); // collapse multiple spaces
+      // Trim to 2KB to prevent context explosion from multiple fetches
+      if (text.length > 2000) text = text.slice(0, 2000) + `\n\n[...已截断，原文 ${text.length} 字符]`;
       return `--- ${url} ---\n${text || "(无有效文本)"}`;
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);

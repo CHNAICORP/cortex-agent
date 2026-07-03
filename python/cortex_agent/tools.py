@@ -392,6 +392,39 @@ def web_search(work_dir: str, query: str) -> str:
     except Exception:
         pass
 
+    # ── Final fallback: Bing Web Search (HTML scraping) ──
+    try:
+        bing_url = f"https://cn.bing.com/search?q={encoded}&setlang=zh-cn"
+        req = urllib.request.Request(bing_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        })
+        with opener.open(req, timeout=10) as r:
+            bing_html = r.read().decode("utf-8", errors="ignore")
+        bing_results = []
+        for m in re.finditer(r'<h2[^>]*>\s*<a[^>]*?href=["\\\']([^"\\\']+)["\\\'][^>]*?>(.*?)</a>', bing_html, re.S|re.I):
+            bing_url = m.group(1)
+            bing_title = re.sub(r'<[^>]+>', '', m.group(2)).strip()
+            if not bing_title or 'bing.com' in bing_url:
+                continue
+            rest = bing_html[m.end():m.end()+2000]
+            sm = re.search(r'<p[^>]*>(.*?)</p>', rest, re.S|re.I)
+            bing_snippet = re.sub(r'<[^>]+>', '', sm.group(1)).strip() if sm else ''
+            bing_results.append((bing_title, bing_url, bing_snippet))
+            if len(bing_results) >= max_results:
+                break
+        if bing_results:
+            out = [f'搜索 "{query}" via Bing ({len(bing_results)} 条):\n']
+            for i, (t, u, s) in enumerate(bing_results, 1):
+                out.append(f"[{i}] {t[:120]}\n    URL: {u}")
+                if s:
+                    out.append(f"    {s[:150]}")
+                out.append("")
+            return "\n".join(out)
+    except Exception:
+        pass
+
     return f"(未找到与 \"{query}\" 相关的结果)"
 
 
@@ -437,8 +470,8 @@ def web_fetch(work_dir: str, url: str) -> str:
                 text = raw.decode("latin-1", errors="ignore")
         else:
             return f"(x) 不支持的内容类型: {ct}"
-        if len(text) > 8000:
-            text = text[:8000] + f"\n\n[... 已截断，原文 {len(text)} 字符]"
+        if len(text) > 4000:
+            text = text[:4000] + f"\n\n[... 已截断，原文 {len(text)} 字符]"
         return f"--- {url} ---\n{text}" if text.strip() else "(无有效文本)"
     except urllib.error.HTTPError as e:
         return f"(x) HTTP {e.code}"
