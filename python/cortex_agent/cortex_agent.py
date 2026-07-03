@@ -601,8 +601,15 @@ class CortexAgent:
                 self._term.error(f"会话保存失败: {e}")
 
     def _auto_extract_facts(self, user_query: str):
-        """Agent 自行判断何时使用 remember_fact 工具——Harness 不注入提示。"""
-        pass
+        """Auto-extract key facts from each query for cross-session recall.
+
+        Each query summary is appended to memory.md so the next session has
+        context about what was discussed, even if the agent didn't explicitly
+        call remember_fact.
+        """
+        if self.memory:
+            summary = user_query[:80].replace("\n", " ").strip()
+            self.memory.append(f"查询: {summary}")
 
     @property
     def session_id(self) -> Optional[str]:
