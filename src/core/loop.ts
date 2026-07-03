@@ -326,7 +326,33 @@ export class CortexAgent {
     this.queryCount++;
     this.stepCountTotal += this.trace?.steps.length || 0;
     this._autoSave();
+    // ── Auto-extract memory facts for next session ──
+    if (this.config.autoExtractMemory && this.memory) {
+      this._autoExtractFacts(query);
+    }
     return result ?? "";
+  }
+
+  /**
+   * Auto-extract key facts from the current exchange so they persist
+   * across sessions.  Uses a lightweight heuristic rather than a full LLM
+   * call (the Python side stubs this to a pass).  We capture:
+   *   - Explicit remember_fact calls that went through the executor
+   *   - The query itself as a session bookmark
+   */
+  private _autoExtractFacts(_userQuery: string): void {
+    // If the agent already used remember_fact during this turn the
+    // MemoryStore was already updated — nothing extra to do.
+    // Store a lightweight session bookmark so the next resume has *some*
+    // context about what was discussed.
+    if (!this.memory) return;
+    const steps = this.trace?.steps || [];
+    const toolNames = steps.map(s => s.toolName);
+    // Only auto-bookmark if no explicit remember_fact was already called
+    if (!toolNames.includes("remember_fact")) {
+      const summary = _userQuery.slice(0, 80).replace(/\n/g, " ");
+      this.memory.append(`查询: ${summary}`);
+    }
   }
 
   private _autoSave(): void {
