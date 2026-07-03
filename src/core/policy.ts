@@ -242,9 +242,9 @@ export class PolicyEngine {
       }
     }
 
-    if (this.config.permissionMode === "yolo") return [true, ""];
-
-    // ── 内容审计（始终执行）──
+    // ── 内容审计（始终执行，即使 yolo 模式也不跳过）──
+    // 文档: "A dangerous command is always blocked"
+    // 判决链: meta lookup → content audit → permission mode → yolo bypass
     let contentOk = true;
     let contentReason = "";
     if (cap === Capability.DB_READ) {
@@ -257,9 +257,18 @@ export class PolicyEngine {
       const target = String(args["url"] || args["query"] || "");
       [contentOk, contentReason] = await this.auditUrl(target);
     } else if (cap === Capability.FS_WRITE) {
-      [contentOk, contentReason] = this.auditPathWrite(args);
+      // yolo 模式跳过路径越权检查，但仍检查危险文件扩展名
+      if (this.config.permissionMode === "yolo") {
+        [contentOk, contentReason] = this.auditPathWriteYolo(args);
+      } else {
+        [contentOk, contentReason] = this.auditPathWrite(args);
+      }
     }
+    // 内容审计失败 → 直接拒绝（即使在 yolo 模式下）
     if (!contentOk) return [false, contentReason];
+
+    // yolo = 跳过权限检查，放行（内容审计已通过）
+    if (this.config.permissionMode === "yolo") return [true, ""];
 
     // ── 权限判决 ──
     const verdict = this.checkPermission(risk, isOutside);
@@ -276,6 +285,15 @@ export class PolicyEngine {
     if (!(full.startsWith(this.workDir + sep) || full === this.workDir)) {
       return [false, `路径越权: ${userPath}`];
     }
+    const ext = path.extname(full).toLowerCase();
+    if (PolicyEngine.FORBIDDEN_EXTS.has(ext)) return [false, `禁止写入 ${ext}`];
+    return [true, full];
+  }
+
+  /** yolo 模式：跳过路径越权检查，但仍检查危险文件扩展名。 */
+  private auditPathWriteYolo(args: Record<string, unknown>): [boolean, string] {
+    const userPath = String(args["path"] || args["filePath"] || args["source"] || "");
+    const full = path.resolve(this.workDir, userPath);
     const ext = path.extname(full).toLowerCase();
     if (PolicyEngine.FORBIDDEN_EXTS.has(ext)) return [false, `禁止写入 ${ext}`];
     return [true, full];

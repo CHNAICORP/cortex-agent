@@ -2,8 +2,8 @@
 Cortex Agent LLM Provider — 多 Provider 支持
 ══════════════════════════════════════════════
 
-支持 DeepSeek / OpenAI，流式 + 非流式调用。
-模型别名解析 + base_url 配置。
+支持 DeepSeek / OpenAI / GLM（智谱），流式 + 非流式调用。
+模型别名解析 + base_url 配置 + provider 感知的 thinking 参数。
 """
 
 import json, time, httpx
@@ -31,7 +31,36 @@ class LLMProvider:
             "base_url": "https://api.openai.com/v1",
             "models": {},
         },
+        "glm": {
+            "name": "glm",
+            "base_url": "https://open.bigmodel.cn/api/paas/v4",
+            "models": {},  # 无别名 — glm-5.2 / glm-5.2-flash 直接作为模型名使用
+        },
     }
+
+    # ── Model Capabilities Registry ──
+    # 每个模型的实际上下文窗口和最大输出 token 数。
+    # context_limit=0 或 max_tokens=0 时自动从此注册表解析。
+    MODEL_CAPABILITIES = {
+        # DeepSeek V4 系列 — 1M 上下文窗口
+        "deepseek-v4-flash":  {"context_window": 1_000_000, "max_output_tokens": 8192},
+        "deepseek-v4-pro":   {"context_window": 1_000_000, "max_output_tokens": 8192},
+        # GLM 系列 — 1M 上下文窗口
+        "glm-5.2":            {"context_window": 1_000_000, "max_output_tokens": 4096},
+        "glm-5.2-flash":     {"context_window": 1_000_000, "max_output_tokens": 4096},
+        # OpenAI 系列
+        "gpt-4o":             {"context_window": 128_000,   "max_output_tokens": 16384},
+        "gpt-4o-mini":        {"context_window": 128_000,   "max_output_tokens": 16384},
+    }
+    # 按前缀匹配的默认能力（用于未注册的模型名）
+    _PREFIX_DEFAULTS = [
+        ("deepseek",  {"context_window": 1_000_000, "max_output_tokens": 8192}),
+        ("glm",       {"context_window": 1_000_000, "max_output_tokens": 4096}),
+        ("gpt-4",     {"context_window": 128_000,   "max_output_tokens": 16384}),
+        ("gpt-3.5",   {"context_window": 16_000,    "max_output_tokens": 4096}),
+    ]
+    # 全局回退默认值
+    _FALLBACK_CAPS = {"context_window": 128_000, "max_output_tokens": 8192}
     # 当前激活的提供者（首次使用前由 AgentConfig.setup_providers 初始化）
     _active = None
     _provider_name = None
@@ -72,6 +101,28 @@ class LLMProvider:
     @classmethod
     def provider_name(cls) -> str:
         return cls._provider_name or "deepseek"
+
+    @classmethod
+    def resolve_capabilities(cls, model: str) -> dict:
+        """解析模型的上下文窗口和最大输出 token 数。
+        
+        查找顺序:
+          1. MODEL_CAPABILITIES 精确匹配
+          2. _PREFIX_DEFAULTS 前缀匹配
+          3. _FALLBACK_CAPS 回退默认值
+        
+        返回: {"context_window": int, "max_output_tokens": int}
+        """
+        model_lower = model.lower().strip()
+        # 1. 精确匹配
+        if model_lower in cls.MODEL_CAPABILITIES:
+            return cls.MODEL_CAPABILITIES[model_lower]
+        # 2. 前缀匹配
+        for prefix, caps in cls._PREFIX_DEFAULTS:
+            if model_lower.startswith(prefix):
+                return caps
+        # 3. 回退
+        return cls._FALLBACK_CAPS
 
     def __init__(self, api_key: str, model: str, tools: List[Dict],
                  timeout: float = 60.0, max_tokens: int = 8192):
@@ -115,6 +166,20 @@ class LLMProvider:
 
     def switch(self, alias: str): self.model = self.resolve(alias)
 
+    def _thinking_kwargs(self, thinking: bool) -> dict:
+        """根据当前 provider 生成 thinking 参数。
+        
+        GLM 使用 thinking_budget 控制推理强度，DeepSeek/OpenAI 使用 reasoning_effort。
+        """
+        if not thinking:
+            return {}
+        provider = self.provider_name()
+        if provider == "glm":
+            # GLM-5.2: thinking.type + thinking_budget
+            return {"extra_body": {"thinking": {"type": "enabled", "thinking_budget": "max"}}}
+        # DeepSeek / OpenAI / default
+        return {"extra_body": {"thinking": {"type": "enabled"}}, "reasoning_effort": "max"}
+
     def call(self, messages: List[Dict], thinking: bool = True
              ) -> Tuple[str, Optional[List[Dict]], Optional[str], str]:
         """非流式调用。返回 (text, tool_calls, reasoning, finish_reason)。
@@ -126,9 +191,7 @@ class LLMProvider:
             "model": self.model, "messages": messages,
             "tools": self.tools, "max_tokens": self.max_tokens,
         }
-        if thinking:
-            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-            kwargs["reasoning_effort"] = "max"
+        kwargs.update(self._thinking_kwargs(thinking))
         resp = self.client.chat.completions.create(**kwargs)
         self._track_usage(resp)
         choice = resp.choices[0]
@@ -158,9 +221,7 @@ class LLMProvider:
             "tools": self.tools, "max_tokens": self.max_tokens,
             "stream": True,
         }
-        if thinking:
-            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-            kwargs["reasoning_effort"] = "max"
+        kwargs.update(self._thinking_kwargs(thinking))
         resp = self.client.chat.completions.create(**kwargs)
         reasoning_parts, text_parts = [], []
         tool_buf: Dict[int, dict] = {}

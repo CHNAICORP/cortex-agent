@@ -39,11 +39,17 @@ from typing import Optional
 
 
 def _smart_merge(base: dict, override: dict):
-    """智能合并：override 中的非空值覆盖 base，空值不覆盖。"""
+    """智能合并：override 中的非空值覆盖 base，空值不覆盖。
+    
+    注意: 0 和 False 是有效值，不应被视为"空"。
+    只有 None 和空字符串/空列表/空字典才跳过。
+    """
     for k, v in override.items():
         if isinstance(v, dict) and isinstance(base.get(k), dict):
             _smart_merge(base[k], v)
-        elif v not in (None, "", 0, [], {}):
+        elif v is None or v == "" or v == [] or v == {}:
+            continue  # 空值不覆盖
+        else:
             base[k] = v
 
 
@@ -94,11 +100,28 @@ def load_settings(project_dir: str = None) -> dict:
                     "api_key": "",
                     "base_url": "https://api.deepseek.com/v1",
                     "models": {"flash": "deepseek-v4-flash", "pro": "deepseek-v4-pro"}
-                }
+                },
+        "glm": {
+            "api_key": "",
+            "base_url": "https://open.bigmodel.cn/api/paas/v4",
+            "models": {}
+        }
             },
             "max_steps": 10,
-            "context_limit": 1000000,
-            "max_tokens": 8192,
+            "context_limit": 0,
+            "max_tokens": 0,
+            "max_input_tokens": 0,
+            # ── ContextGovernor 可调参数 ──
+            "compress_threshold": 1500,
+            "compress_head": 600,
+            "compress_tail": 400,
+            "safety_margin": 4096,
+            "input_warn_pct": 80,
+            "input_force_pct": 90,
+            # ── ToolExecutor 可调参数 ──
+            "max_result_chars": 2000,
+            # ── Memory 注入控制 ──
+            "memory_inject_count": 30,
             "permission_mode": "standard",
             "auto_extract_memory": True,
             "memory_enabled": True,
@@ -146,7 +169,10 @@ def apply_to_config(config, settings: dict):
                 "work_dir", "memory_dir", "sessions_dir", "skills_dir",
                 "memory_enabled", "sessions_enabled", "auto_extract_memory",
                 "permission_mode", "permission_remember", "workspace_only",
-                "context_limit", "max_tokens"):
+                "context_limit", "max_tokens", "max_input_tokens",
+                "compress_threshold", "compress_head", "compress_tail",
+                "safety_margin", "input_warn_pct", "input_force_pct",
+                "max_result_chars", "memory_inject_count"):
         if key in settings:
             setattr(config, key, settings[key])
 
@@ -161,7 +187,12 @@ def create_default_settings(path: str) -> dict:
                 "api_key": "",
                 "base_url": "https://api.deepseek.com/v1",
                 "models": {"flash": "deepseek-v4-flash", "pro": "deepseek-v4-pro"},
-            }
+            },
+            "glm": {
+                "api_key": "",
+                "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                "models": {},
+            },
         },
         "web_search": {
             "provider": "duckduckgo",       # duckduckgo | brave | serpapi | tavily
@@ -180,8 +211,20 @@ def create_default_settings(path: str) -> dict:
         "permission_mode": "standard",
         "permission_remember": True,
         "workspace_only": False,
-        "context_limit": 1000000,
-        "max_tokens": 8192,
+        "context_limit": 0,
+        "max_tokens": 0,
+        "max_input_tokens": 0,
+        # ── ContextGovernor 可调参数 (0=使用默认值) ──
+        "compress_threshold": 1500,
+        "compress_head": 600,
+        "compress_tail": 400,
+        "safety_margin": 4096,
+        "input_warn_pct": 80,
+        "input_force_pct": 90,
+        # ── ToolExecutor 可调参数 ──
+        "max_result_chars": 2000,
+        # ── Memory 注入控制 ──
+        "memory_inject_count": 30,
         "mcpServers": {
             "playwright": {
                 "command": "npx",

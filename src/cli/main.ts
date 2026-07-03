@@ -78,9 +78,12 @@ async function main(): Promise<void> {
     const cfgPath = path.join(process.cwd(), ".cortx", "settings.json");
     const template = {
       model: "pro", provider: "deepseek",
-      providers: { deepseek: { api_key: "", base_url: "https://api.deepseek.com/v1", models: { flash: "deepseek-v4-flash", pro: "deepseek-v4-pro" } } },
+      providers: { deepseek: { api_key: "", base_url: "https://api.deepseek.com/v1", models: { flash: "deepseek-v4-flash", pro: "deepseek-v4-pro" } },
+                   glm: { api_key: "", base_url: "https://open.bigmodel.cn/api/paas/v4", models: {} } },
       web_search: { provider: "duckduckgo", brave_api_key: "", serpapi_api_key: "", tavily_api_key: "", max_results: 5, timeout: 10 },
-      max_steps: 10, context_limit: 1000000, max_tokens: 8192, permission_mode: "standard",
+      max_steps: 10, context_limit: 0, max_tokens: 0, max_input_tokens: 0, permission_mode: "standard",
+      compress_threshold: 1500, compress_head: 600, compress_tail: 400, safety_margin: 4096,
+      input_warn_pct: 80, input_force_pct: 90, max_result_chars: 2000, memory_inject_count: 30,
       auto_extract_memory: true, memory_enabled: true, sessions_enabled: true,
     };
     fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
@@ -109,27 +112,41 @@ async function main(): Promise<void> {
     console.log(`    选择模型提供商:`);
     console.log(`      [1] DeepSeek (推荐，国内可用)`);
     console.log(`      [2] OpenAI`);
-    const choice = (await ask(`    请选择 (1/2): `)).trim() || "1";
-    const prov = choice === "2" ? "openai" : "deepseek";
+    console.log(`      [3] GLM 智谱 (GLM-5.2，国产开源)`);
+    const choice = (await ask(`    请选择 (1/2/3): `)).trim() || "1";
+    const provMap: Record<string, string> = { "1": "deepseek", "2": "openai", "3": "glm" };
+    const prov = provMap[choice] || "deepseek";
     console.log(`\n    输入 API Key:`);
     console.log(`    (DeepSeek: https://platform.deepseek.com/api_keys)`);
+    console.log(`    (OpenAI: https://platform.openai.com/api-keys)`);
+    console.log(`    (GLM 智谱: https://open.bigmodel.cn/console/apikeys)`);
     let apiKey = (await ask(`    API Key: `)).trim();
     while (!apiKey) { apiKey = (await ask(`    API Key (不能为空): `)).trim(); }
     console.log(`\n    选择模型:`);
-    const models = prov === "openai" ? { "1": ["gpt-4o", "gpt-4o"], "2": ["gpt-4o-mini", "gpt-4o-mini"] }
-      : { "1": ["pro", "deepseek-v4-pro"], "2": ["flash", "deepseek-v4-flash"] };
-    const modelsMap: Record<string, string[]> = models;
+    const allModels: Record<string, Record<string, string[]>> = {
+      deepseek: { "1": ["pro", "deepseek-v4-pro"], "2": ["flash", "deepseek-v4-flash"] },
+      openai: { "1": ["gpt-4o", "gpt-4o"], "2": ["gpt-4o-mini", "gpt-4o-mini"] },
+      glm: { "1": ["glm-5.2", "glm-5.2"], "2": ["glm-5.2-flash", "glm-5.2-flash"] },
+    };
+    const modelsMap = allModels[prov] || allModels.deepseek;
     for (const [k, v] of Object.entries(modelsMap)) {
       console.log(`      [${k}] ${v[0]} (${v[1]})`);
     }
     const mChoice = (await ask(`    请选择 (1/2): `)).trim() || "1";
     const [modelAlias, modelName] = modelsMap[mChoice] || modelsMap["1"];
     rl.close();
+    const baseUrls: Record<string, string> = {
+      deepseek: "https://api.deepseek.com/v1",
+      openai: "https://api.openai.com/v1",
+      glm: "https://open.bigmodel.cn/api/paas/v4",
+    };
     const userPath = path.join(os.homedir(), ".cortx", "settings.json");
     const newSettings = {
       model: modelAlias, provider: prov,
-      providers: { [prov]: { api_key: apiKey, base_url: `https://api.${prov}.com/v1`, models: { [modelAlias]: modelName } } },
-      max_steps: 10, context_limit: 1000000, max_tokens: 8192, permission_mode: "standard",
+      providers: { [prov]: { api_key: apiKey, base_url: baseUrls[prov], models: { [modelAlias]: modelName } } },
+      max_steps: 10, context_limit: 0, max_tokens: 0, max_input_tokens: 0, permission_mode: "standard",
+      compress_threshold: 1500, compress_head: 600, compress_tail: 400, safety_margin: 4096,
+      input_warn_pct: 80, input_force_pct: 90, max_result_chars: 2000, memory_inject_count: 30,
       auto_extract_memory: true, memory_enabled: true, sessions_enabled: true,
     };
     fs.mkdirSync(path.dirname(userPath), { recursive: true });
@@ -157,8 +174,17 @@ async function main(): Promise<void> {
     model: LLMProvider.resolve(model),
     workDir,
     permissionMode,
-    contextLimit: (settings.context_limit as number) || 1_000_000,
-    maxTokens: (settings.max_tokens as number) || 8192,
+    contextLimit: (settings.context_limit as number) || 0,
+    maxTokens: (settings.max_tokens as number) || 0,
+    maxInputTokens: (settings.max_input_tokens as number) || 0,
+    compressThreshold: (settings.compress_threshold as number) || 0,
+    compressHead: (settings.compress_head as number) || 0,
+    compressTail: (settings.compress_tail as number) || 0,
+    safetyMargin: (settings.safety_margin as number) || 0,
+    inputWarnPct: (settings.input_warn_pct as number) || 0,
+    inputForcePct: (settings.input_force_pct as number) || 0,
+    maxResultChars: (settings.max_result_chars as number) || 0,
+    memoryInjectCount: (settings.memory_inject_count as number) || 0,
     memoryEnabled: settings.memory_enabled !== false,
     sessionsEnabled: settings.sessions_enabled !== false,
     autoExtractMemory: settings.auto_extract_memory !== false,
@@ -325,13 +351,18 @@ async function main(): Promise<void> {
     // ── /reset ──
     if (q === "/reset") { agent.reset(); console.log("上下文已重置（含拒绝计数和暂停状态）"); showPrompt(); rl.prompt(); continue; }
     // ── /context ──
-    if (q === "/context") {
-      const ctx = agent.contextTokens;
-      const lim = agent.contextLimit;
-      const pct = agent.contextPct;
-      console.log(`  ═══ 上下文容量 ═══`);
-      console.log(`  Token:   ${ctx.toLocaleString()} / ${lim.toLocaleString()}  (${pct}%)`);
-      const cs = agent.cacheStats;
+if (q === "/context") {
+const ctx = agent.contextTokens;
+const lim = agent.contextLimit;
+const pct = agent.contextPct;
+console.log(`  ═══ 上下文容量 ═══`);
+console.log(`  Token:   ${ctx.toLocaleString()} / ${lim.toLocaleString()}  (${pct}%)`);
+// Token 预算明细
+console.log(`  ═══ Token 预算 ═══`);
+console.log(`  输入上限: ${agent.maxInputTokens.toLocaleString()} tokens  (已用 ${agent.inputTokensPct}%)`);
+console.log(`  输出上限: ${agent.maxTokens.toLocaleString()} tokens`);
+console.log(`  上下文窗: ${lim.toLocaleString()} tokens  (输入+输出+安全余量)`);
+const cs = agent.cacheStats;
       if (cs.calls > 0) {
         console.log(`  ═══ 缓存统计 ═══`);
         console.log(`  API 调用: ${cs.calls} 次`);

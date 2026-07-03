@@ -157,10 +157,9 @@ class PolicyEngine:
                     is_outside = self.is_outside_workspace(args[pname])
                     if is_outside:
                         break
-        # yolo = 全部放行
-        if self.config and self.config.permission_mode == "yolo":
-            return True, ""
-        # ── 内容审计（始终执行，不受 CONFIRM 短路影响）──
+        # ── 内容审计（始终执行，即使 yolo 模式也不跳过）──
+        # 文档: "A dangerous command is always blocked"
+        # 判决链: meta lookup → content audit → permission mode → yolo bypass
         content_ok = True
         content_reason = ""
         if cap == Capability.DB_READ:
@@ -173,10 +172,17 @@ class PolicyEngine:
             target = args.get("url") or args.get("query", "")
             content_ok, content_reason = self._audit_url(target)
         elif cap == Capability.FS_WRITE:
-            content_ok, content_reason = self._audit_path_write(args)
-        # 内容审计失败 → 直接拒绝
+            # yolo 模式跳过路径越权检查，但仍检查危险文件扩展名
+            if self.config and self.config.permission_mode == "yolo":
+                content_ok, content_reason = self._audit_path_write_yolo(args)
+            else:
+                content_ok, content_reason = self._audit_path_write(args)
+        # 内容审计失败 → 直接拒绝（即使在 yolo 模式下）
         if not content_ok:
             return False, content_reason
+        # yolo = 跳过权限检查，放行（内容审计已通过）
+        if self.config and self.config.permission_mode == "yolo":
+            return True, ""
         # ── 权限模式判决 ──
         verdict = self._check_permission(risk, is_outside)
         if verdict == AuditVerdict.CONFIRM:
@@ -202,6 +208,14 @@ class PolicyEngine:
         path = args.get("path", "")
         ok, resolved = self.resolve_path(path)
         if not ok: return ok, resolved
+        ext = os.path.splitext(resolved)[1].lower()
+        if ext in self.FORBIDDEN_EXTS: return False, f"禁止写入 {ext}"
+        return True, resolved
+
+    def _audit_path_write_yolo(self, args: dict) -> Tuple[bool, str]:
+        """yolo 模式：跳过路径越权检查，但仍检查危险文件扩展名。"""
+        path = args.get("path", "")
+        resolved = os.path.realpath(os.path.join(self.work_dir, path))
         ext = os.path.splitext(resolved)[1].lower()
         if ext in self.FORBIDDEN_EXTS: return False, f"禁止写入 {ext}"
         return True, resolved

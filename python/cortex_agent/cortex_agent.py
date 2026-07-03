@@ -175,10 +175,18 @@ class Observer:
 # ══════════════════════════════════════════════════════════════
 
 class ToolExecutor:
-    MAX_RESULT_CHARS = 3000
+    """工具执行器 — 隔离执行 + 智能结果截断。
 
-    def __init__(self, registry: 'ToolRegistry', work_dir: str, timeout: int = 10):
+    截断策略（参考 Claude Code tool result handling）:
+      - 默认截断到 2000 字符（可在 settings.json 中通过 max_result_chars 自定义）
+      - 保留首尾内容，中间用省略标记
+      - Python 沙箱输出单独截断
+    """
+    MAX_RESULT_CHARS = 2000  # 类常量保留作为默认值和向后兼容
+
+    def __init__(self, registry: 'ToolRegistry', work_dir: str, timeout: int = 10, max_result_chars: int = 0):
         self.reg = registry; self.work_dir = work_dir; self.timeout = timeout
+        self.max_result_chars = max_result_chars if max_result_chars > 0 else ToolExecutor.MAX_RESULT_CHARS
 
     def execute(self, name: str, args: dict) -> str:
         fn = self.reg.get(name)
@@ -190,11 +198,19 @@ class ToolExecutor:
             clean = {k: v for k, v in args.items() if k != "work_dir"}
             result = fn(self.work_dir, **clean)
             result = str(result) if not isinstance(result, str) else result
-            if len(result) > self.MAX_RESULT_CHARS:
-                result = result[:self.MAX_RESULT_CHARS] + f"\n\n[...已截断，原{len(result)}字符]"
-            return result
+            return self._truncate(result)
         except PermissionError as e: return f"(x) 权限错误: {e}"
         except Exception as e: return f"(x) {e}"
+
+    def _truncate(self, result: str) -> str:
+        """智能截断：保留首尾，中间省略。"""
+        limit = self.max_result_chars
+        if len(result) <= limit:
+            return result
+        head = limit * 2 // 3
+        tail = limit // 3
+        omitted = len(result) - head - tail
+        return f"{result[:head]}\n\n[...已截断，省略 {omitted} 字符...]\n\n{result[-tail:]}"
 
     def _exec_python_isolated(self, code: str) -> str:
         import tempfile, subprocess, sys as _sys, os as _os
@@ -230,13 +246,38 @@ DEFAULT_SYSTEM = (
 )
 
 class ContextGovernor:
-    # Token 估算常量（中文 ≈1.5 token/字，英文 ≈0.75 token/字）
-    TOKENS_PER_CHAR = 0.4  # 混合中英文的经验值
-    CONTEXT_LIMIT_TOKENS = 1_000_000  # DeepSeek V4 默认 1M，可通过 settings.json 自定义
+    """上下文治理器 — token 体积感知 + 工具结果自动压缩。
+
+    设计哲学（参考 Claude Code context window 管理）:
+      - 不只按消息条数裁剪，更按 token 体积裁剪
+      - tool result 超长时自动压缩为摘要（保留首尾 + 中间省略）
+      - 保留最近一轮 tool_call + tool_result 完整配对
+      - system prompt 永不裁剪
+
+    三级输入压力预警:
+      80% max_input_tokens → WARN  (压缩超长 tool result)
+      90% max_input_tokens → FORCE (丢弃最早非 system 消息)
+      100% max_input_tokens → HARD  (只保留 system + 最近3条)
+    """
+    TOKENS_PER_CHAR = 0.4  # 混合中英文经验值
+    CONTEXT_LIMIT_TOKENS = 1_000_000
+    # 工具结果压缩阈值（字符数）
+    COMPRESS_THRESHOLD = 1500
+    COMPRESS_HEAD = 600
+    COMPRESS_TAIL = 400
+    # 安全余量：预留给 tokenizer 估算误差 + tool schema 开销
+    SAFETY_MARGIN = 4096
+    # 输入 token 预警线（占 max_input_tokens 的百分比）
+    INPUT_WARN_PCT = 80
+    INPUT_FORCE_PCT = 90
 
     def __init__(self, system: str = "", work_dir: str = "", max_msgs: int = 24,
                  memory_context: str = "", history_summary: str = "",
-                 kb_context: str = "", context_limit: int = 1_000_000):
+                 kb_context: str = "", context_limit: int = 1_000_000,
+                 max_input_tokens: int = 0, max_tokens: int = 16384,
+                 compress_threshold: int = 0, compress_head: int = 0,
+                 compress_tail: int = 0, safety_margin: int = 0,
+                 input_warn_pct: int = 0, input_force_pct: int = 0):
         parts = [system or DEFAULT_SYSTEM]
         if kb_context:
             parts.append(f"\n[项目知识库]\n{kb_context}")
@@ -250,6 +291,19 @@ class ContextGovernor:
         self.system = {"role": "system", "content": content}
         self.max_msgs = max_msgs
         self.context_limit = context_limit
+        self.max_tokens = max_tokens
+        # 可调参数：使用传入值或回退到类常量默认值
+        self.compress_threshold = compress_threshold or ContextGovernor.COMPRESS_THRESHOLD
+        self.compress_head = compress_head or ContextGovernor.COMPRESS_HEAD
+        self.compress_tail = compress_tail or ContextGovernor.COMPRESS_TAIL
+        self.safety_margin = safety_margin or ContextGovernor.SAFETY_MARGIN
+        self.input_warn_pct = input_warn_pct or ContextGovernor.INPUT_WARN_PCT
+        self.input_force_pct = input_force_pct or ContextGovernor.INPUT_FORCE_PCT
+        # max_input_tokens: 0 = 自动计算 (context_limit - max_tokens - safety_margin)
+        if max_input_tokens and max_input_tokens > 0:
+            self.max_input_tokens = max_input_tokens
+        else:
+            self.max_input_tokens = max(context_limit - max_tokens - self.safety_margin, 16000)
         self._kb_context = kb_context
 
     @staticmethod
@@ -258,7 +312,6 @@ class ContextGovernor:
         total = 0
         for m in msgs:
             content = m.get("content", "") or ""
-            # 工具调用的 function 字段
             if m.get("tool_calls"):
                 import json as _j
                 for tc in m["tool_calls"]:
@@ -274,8 +327,19 @@ class ContextGovernor:
     @staticmethod
     def context_pct(msgs: list, limit: int = 1_000_000) -> int:
         """当前上下文窗口使用百分比。"""
+        if limit <= 0:
+            return 0
         est = ContextGovernor.estimate_tokens(msgs)
-        return min(int(est / limit * 100), 99)
+        return min(int(est / limit * 100), 100)
+
+    def _compress_result(self, text: str) -> str:
+        """压缩超长工具结果：保留首尾，中间用省略标记替代。"""
+        if len(text) <= self.compress_threshold:
+            return text
+        head = text[:self.compress_head]
+        tail = text[-self.compress_tail:]
+        omitted = len(text) - self.compress_head - self.compress_tail
+        return f"{head}\n\n[...已压缩，省略 {omitted} 字符...]\n\n{tail}"
 
     @staticmethod
     def _load_kb(project_dir: str) -> str:
@@ -286,7 +350,6 @@ class ContextGovernor:
             try:
                 with open(kb_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                # 处理 @import 指令
                 import re as _re
                 def _resolve_imports(text, base_dir, depth=0):
                     if depth > 3:
@@ -314,24 +377,135 @@ class ContextGovernor:
         ctx.append({"role": "user", "content": query}); return ctx
 
     def govern(self, msgs: List[Dict]) -> List[Dict]:
-        if len(msgs) <= self.max_msgs: return msgs
-        limit = self.max_msgs - 1; reserve = set(); has_pair = False
-        for i in range(len(msgs) - 1, 1, -1):
-            if msgs[i].get("role") == "tool" and msgs[i - 1].get("tool_calls"):
-                reserve = {i - 1, i}; has_pair = True; limit -= 2; break
-        kept = []; i = len(msgs) - 1
-        while i > 0 and len(kept) < max(limit, 0):
-            if i in reserve: i -= 1; continue
-            kept.append(msgs[i]); i -= 1
-        kept.reverse()
-        if has_pair:
-            a, t = sorted(reserve)
-            kept.append(msgs[a]); kept.append(msgs[t])
-        trimmed = len(msgs) - 1 - len(kept)
-        if trimmed > 0:
-            kept.insert(0, {"role": "system", "content": f"[{trimmed}条历史已压缩]"})
-            while len(kept) > self.max_msgs - 1: kept.pop(1 if len(kept) > 1 else 0)
-        return [msgs[0]] + kept
+        """三重裁剪：条数裁剪 + tool result 压缩 + 输入 token 体积管控。
+
+        裁剪策略（参考 Claude Code 的 context window 管理）:
+          1. 按条数裁剪到 max_msgs，保留最近一轮 tool_call+result 配对
+          2. 遍历保留的消息，对超长 tool result 执行首尾压缩
+          3. 输入 token 三级预警:
+             ≥80% max_input_tokens → 压缩所有 tool result（即使未超 COMPRESS_THRESHOLD 的也强制压缩）
+             ≥90% max_input_tokens → 丢弃最早的非 system 消息
+             ≥100% max_input_tokens → 只保留 system + 最近 3 条
+        """
+        # Step 1: 条数裁剪
+        if len(msgs) <= self.max_msgs:
+            result = list(msgs)
+        else:
+            limit = self.max_msgs - 1; reserve = set(); has_pair = False
+            for i in range(len(msgs) - 1, 1, -1):
+                if msgs[i].get("role") == "tool" and msgs[i - 1].get("tool_calls"):
+                    reserve = {i - 1, i}; has_pair = True; limit -= 2; break
+            kept = []; i = len(msgs) - 1
+            while i > 0 and len(kept) < max(limit, 0):
+                if i in reserve: i -= 1; continue
+                kept.append(msgs[i]); i -= 1
+            kept.reverse()
+            if has_pair:
+                a, t = sorted(reserve)
+                kept.append(msgs[a]); kept.append(msgs[t])
+            trimmed = len(msgs) - 1 - len(kept)
+            if trimmed > 0:
+                kept.insert(0, {"role": "system", "content": f"[{trimmed}条历史已压缩]"})
+                while len(kept) > self.max_msgs - 1: kept.pop(1 if len(kept) > 1 else 0)
+            result = [msgs[0]] + kept
+
+        # Step 2: 压缩超长 tool result
+        for m in result:
+            if m.get("role") == "tool":
+                content = m.get("content", "")
+                if isinstance(content, str) and len(content) > self.compress_threshold:
+                    m["content"] = self._compress_result(content)
+
+        # Step 3: 输入 token 体积管控（三级预警）
+        input_tokens = self.estimate_tokens(result)
+        warn_threshold = int(self.max_input_tokens * self.input_warn_pct / 100)
+        force_threshold = int(self.max_input_tokens * self.input_force_pct / 100)
+
+        if input_tokens >= self.max_input_tokens:
+            # HARD: 只保留 system + 最近 3 条
+            if len(result) > 4:
+                result = [result[0]] + result[-3:]
+        elif input_tokens >= force_threshold:
+            # FORCE: 逐步丢弃最早的非 system 消息，直到降到 force_threshold 以下
+            while len(result) > 4 and self.estimate_tokens(result) >= force_threshold:
+                result.pop(1)
+            # 压缩标记
+            result.insert(1, {"role": "system", "content": "[上下文压力过高，已强制裁剪历史]"})
+        elif input_tokens >= warn_threshold:
+            # WARN: 强制压缩所有 tool result（包括未超阈值的）
+            for m in result:
+                if m.get("role") == "tool":
+                    content = m.get("content", "")
+                    if isinstance(content, str) and len(content) > 200:
+                        m["content"] = self._compress_result(content)
+
+        # Step 4: 修复 tool_calls/tool 配对完整性
+        # 裁剪可能打破 assistant(tool_calls) → tool(result) 的配对关系
+        # 导致 LLM API 报错: "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"
+        result = self._fix_tool_pairing(result)
+
+        return result
+
+    @staticmethod
+    def _fix_tool_pairing(msgs: list) -> list:
+        """修复 tool_calls/tool 配对完整性。
+
+        规则:
+          1. 如果 assistant 消息有 tool_calls，但其后缺少对应的 tool 结果，
+             则移除该 assistant 消息的 tool_calls（保留 content 作为普通回复）
+          2. 如果 tool 消息的前一条不是带 tool_calls 的 assistant 消息，
+             则移除该孤立的 tool 消息
+          3. 如果 assistant 有多个 tool_calls 但只有部分有 tool 结果，
+             只保留有结果的部分
+          4. 只保留 tool_call_id 在 tool_calls 中的 tool 结果，过滤孤立的
+        """
+        if not msgs:
+            return msgs
+        fixed = []
+        i = 0
+        while i < len(msgs):
+            m = msgs[i]
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                # 收集这个 assistant 消息之后所有连续的 tool 结果
+                tc_ids = {tc.get("id") for tc in m["tool_calls"]}
+                tool_results = []
+                j = i + 1
+                while j < len(msgs) and msgs[j].get("role") == "tool":
+                    tool_results.append(msgs[j])
+                    j += 1
+                # 只保留 tool_call_id 在 tc_ids 中的 tool 结果（过滤孤立结果）
+                matched_results = [tr for tr in tool_results if tr.get("tool_call_id") in tc_ids]
+                matched_ids = {tr.get("tool_call_id") for tr in matched_results}
+                if matched_ids:
+                    # 有匹配的 tool 结果 → 只保留有结果的 tool_calls
+                    kept_tcs = [tc for tc in m["tool_calls"] if tc.get("id") in matched_ids]
+                    new_m = dict(m)
+                    new_m["tool_calls"] = kept_tcs
+                    fixed.append(new_m)
+                    fixed.extend(matched_results)
+                else:
+                    # 没有任何匹配的 tool 结果 → 移除 tool_calls，保留 content
+                    new_m = dict(m)
+                    del new_m["tool_calls"]
+                    if new_m.get("content"):
+                        fixed.append(new_m)
+                    # content 也为空则跳过
+                i = j
+            elif m.get("role") == "tool":
+                # 孤立的 tool 消息（前面没有带 tool_calls 的 assistant）
+                # 直接跳过
+                i += 1
+            else:
+                fixed.append(m)
+                i += 1
+        return fixed
+
+    def input_tokens_pct(self, msgs: list) -> int:
+        """当前输入 token 占 max_input_tokens 的百分比。"""
+        if self.max_input_tokens <= 0:
+            return 0
+        est = self.estimate_tokens(msgs)
+        return min(int(est / self.max_input_tokens * 100), 100)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -360,8 +534,20 @@ class AgentConfig:
     permission_mode: str = "standard"   # standard | auto | yolo
     permission_remember: bool = True    # 记住用户在会话中的决策
     workspace_only: bool = False        # True=回退到旧沙箱模式
-    context_limit: int = 1_000_000     # DeepSeek V4 上下文窗口 (1M tokens)
-    max_tokens: int = 8192             # LLM 输出 token 上限（reasoning + content 共享）
+    context_limit: int = 0              # 0=自动从模型能力注册表解析
+    max_tokens: int = 0                # 0=自动从模型能力注册表解析
+    max_input_tokens: int = 0          # 0=自动计算: context_limit - max_tokens - safety_margin
+    # ── ContextGovernor 可调参数 (均可在 settings.json 中自定义) ──
+    compress_threshold: int = 1500     # tool result 压缩阈值（字符数）
+    compress_head: int = 600           # 压缩时保留的首部字符数
+    compress_tail: int = 400           # 压缩时保留的尾部字符数
+    safety_margin: int = 4096          # tokenizer 估算误差 + tool schema 开销的安全余量
+    input_warn_pct: int = 80           # 输入 token 占比达此百分比时触发 WARN 压缩
+    input_force_pct: int = 90          # 输入 token 占比达此百分比时触发 FORCE 裁剪
+    # ── ToolExecutor 可调参数 ──
+    max_result_chars: int = 2000       # 工具结果截断阈值（字符数）
+    # ── Memory 注入控制 ──
+    memory_inject_count: int = 30      # 注入 system prompt 的最大记忆条数
 
 
 # ══════════════════════════════════════════════════════════════
@@ -382,7 +568,8 @@ class CortexAgent:
             os.makedirs(wd, exist_ok=True)
             self.config.work_dir = wd
         self.policy = PolicyEngine(wd, self.config)
-        self.executor = ToolExecutor(registry, wd, self.config.tool_timeout)
+        self.executor = ToolExecutor(registry, wd, self.config.tool_timeout,
+                                      max_result_chars=self.config.max_result_chars)
         # ── Runtime state (工作区 = 运行时产物) ──
         from . import memory as mem_module
         cwd = os.getcwd()
@@ -410,12 +597,21 @@ class CortexAgent:
         # ── Adaptive Guard: cumulative rejection tracking ──
         self._rejection_counts: Dict[Capability, int] = {}
         self._suspended_capabilities: Set[Capability] = set()
+        # ── Model capabilities auto-resolve ──
+        # context_limit=0 或 max_tokens=0 时，从模型能力注册表自动解析
+        resolved_model = LLMProvider.resolve(self.config.model)
+        caps = LLMProvider.resolve_capabilities(resolved_model)
+        if self.config.context_limit == 0:
+            self.config.context_limit = caps["context_window"]
+        if self.config.max_tokens == 0:
+            self.config.max_tokens = caps["max_output_tokens"]
         self.llm = LLMProvider(self.config.api_key,
-                               LLMProvider.resolve(self.config.model), registry.schemas,
+                               resolved_model, registry.schemas,
                                timeout=self.config.think_timeout,
                                max_tokens=self.config.max_tokens)
         self._ctx: List[Dict] = []; self._trace = None
         self._last_reasoning: str = None
+        self._last_llm_error: str = ""
         self._term: Optional['Terminal'] = None  # 终端显示回调
         self._label_done = False
         # ── Permission decision memory (session-scoped) ──
@@ -424,14 +620,27 @@ class CortexAgent:
     def _make_governor(self) -> ContextGovernor:
         """构建 ContextGovernor，注入知识库+记忆+历史摘要+上下文窗口配置。"""
         kb_ctx = self._load_kb()
-        memory_ctx = self.memory.to_system_context() if self.memory else ""
+        # 动态记忆注入：根据记忆条数和上下文预算决定注入量
+        memory_ctx = ""
+        if self.memory:
+            total = self.memory.count()
+            inject_n = min(total, self.config.memory_inject_count) if total > self.config.memory_inject_count else total
+            memory_ctx = self.memory.to_system_context(max_entries=inject_n)
         history_summary = ""
         if self.sessions and self._session_id:
             history_summary = self.sessions.get_history_summary(self._session_id) or ""
         return ContextGovernor(self.config.system_prompt,
-            self._work_dir_path(), self.config.max_context_msgs,
-            memory_context=memory_ctx, history_summary=history_summary,
-            kb_context=kb_ctx, context_limit=self.config.context_limit)
+                               self._work_dir_path(), self.config.max_context_msgs,
+                               memory_context=memory_ctx, history_summary=history_summary,
+                               kb_context=kb_ctx, context_limit=self.config.context_limit,
+                               max_input_tokens=self.config.max_input_tokens,
+                               max_tokens=self.config.max_tokens,
+                               compress_threshold=self.config.compress_threshold,
+                               compress_head=self.config.compress_head,
+                               compress_tail=self.config.compress_tail,
+                               safety_margin=self.config.safety_margin,
+                               input_warn_pct=self.config.input_warn_pct,
+                               input_force_pct=self.config.input_force_pct)
 
     def _load_kb(self) -> str:
         """加载项目知识库 CORTEX.md。"""
@@ -465,6 +674,19 @@ class CortexAgent:
         return self.config.context_limit
 
     @property
+    def max_input_tokens(self) -> int:
+        return self.governor.max_input_tokens
+
+    @property
+    def max_tokens(self) -> int:
+        return self.config.max_tokens
+
+    @property
+    def input_tokens_pct(self) -> int:
+        """当前输入 token 占 max_input_tokens 的百分比。"""
+        return self.governor.input_tokens_pct(self._ctx)
+
+    @property
     def cache_stats(self) -> dict:
         """缓存命中率统计（基于 LLM API 响应）。"""
         return self.llm.cache_stats
@@ -474,6 +696,13 @@ class CortexAgent:
 
     def switch_model(self, alias: str):
         self.llm.switch(alias); self.config.model = self.llm.model
+        # 重新解析模型能力，更新 context_limit 和 max_tokens
+        caps = LLMProvider.resolve_capabilities(self.llm.model)
+        self.config.context_limit = caps["context_window"]
+        self.config.max_tokens = caps["max_output_tokens"]
+        self.llm.max_tokens = self.config.max_tokens
+        # 重建 governor 以应用新的上下文窗口
+        self.governor = self._make_governor()
 
     def switch_permission_mode(self, mode: str) -> str:
         """运行时切换权限模式。返回新模式的描述。
@@ -608,19 +837,15 @@ class CortexAgent:
     def _auto_extract_facts(self, user_query: str):
         """Auto-extract key facts from each query for cross-session recall.
 
-        Each query summary and key search/fetch results are appended to
-        memory.md so the next session has context about what was discussed,
-        even if the agent didn't explicitly call remember_fact.
+        记忆永久保留，不自动删除。只控制注入到 system prompt 的条数。
         """
         if not self.memory:
             return
         steps = self._trace.steps if self._trace else []
         tool_names = [s.tool_name for s in steps]
-        # Only auto-bookmark if no explicit remember_fact was already called
         if "remember_fact" not in tool_names:
             summary = user_query[:80].replace("\n", " ").strip()
             self.memory.append(f"查询: {summary}")
-        # Auto-extract web_search result summaries into memory
         for step in steps:
             if step.tool_name == "web_search" and step.success:
                 result = step.result_preview
@@ -632,6 +857,7 @@ class CortexAgent:
                 m = re.search(r'---\s*(https?://\S+)', step.result_preview)
                 if m:
                     self.memory.append(f"抓取: {m.group(1)}")
+        self._trim_memory_was_here: bool = False  # removed — memories are permanent now
 
     @property
     def session_id(self) -> Optional[str]:
@@ -646,7 +872,8 @@ class CortexAgent:
             self._ctx = self.governor.govern(self._ctx)
             content, tool_calls = self._think()
             if content is None and not tool_calls:
-                trace.error = "LLM 调用失败（空响应，已重试3次+注入提示）"
+                err = self._last_llm_error or "未知错误"
+                trace.error = f"LLM 调用失败: {err}"
                 if self._term:
                     self._term._w(f"\n{trace.error}\n")
                     return ""
@@ -740,25 +967,30 @@ class CortexAgent:
         return None
 
     def _think(self) -> Tuple[Optional[str], Optional[List[Dict]]]:
-        """Think 阶段 — 调用 LLM，带渐进降级恢复。
+        """Think 阶段 — 调用 LLM，带输入压力感知的渐进降级恢复。
 
-        3 级降级策略（每级改变策略，不做无意义重试）:
+        4 级降级策略（每级改变策略+减少输入压力）:
           Level 1: thinking=True  — 正常推理模式
           Level 2: thinking=False — 关闭推理，全部 token 留给 content/tool_calls
-          Level 3: thinking=False + nudge — 注入提示消息强制生成回答
+          Level 3: thinking=False + 强制 govern — 压缩历史 tool result 后重试
+          Level 4: thinking=False + nudge — 注入提示消息强制生成回答
+
+        所有异常被捕获并记录到 self._last_llm_error，不静默吞掉。
         """
         term = self._term
+        self._last_llm_error = ""
 
-        def _do_call(thinking: bool = True):
+        def _do_call(thinking: bool = True, ctx_override: list = None):
+            ctx = ctx_override if ctx_override is not None else self._ctx
             if term:
                 return self.llm.call_stream(
-                    self._ctx,
+                    ctx,
                     on_text=term.think_token,
                     on_answer=term.answer_token,
                     on_tool=self._tool_labeled(),
                     thinking=thinking)
             else:
-                return self.llm.call(self._ctx, thinking=thinking)
+                return self.llm.call(ctx, thinking=thinking)
 
         # ── Level 1: 正常推理模式 ──
         try:
@@ -766,8 +998,8 @@ class CortexAgent:
             if reasoning: self._last_reasoning = reasoning
             if text or tcs:
                 return text, tcs
-        except Exception:
-            pass
+        except Exception as e:
+            self._last_llm_error = f"[L1] {e}"
 
         # ── Level 2: 关闭推理模式（解决 finish_reason=length） ──
         time.sleep(0.5)
@@ -775,10 +1007,20 @@ class CortexAgent:
             text, tcs, reasoning, finish_reason = _do_call(thinking=False)
             if text or tcs:
                 return text, tcs
-        except Exception:
-            pass
+        except Exception as e:
+            self._last_llm_error = f"[L2] {e}"
 
-        # ── Level 3: 关闭推理 + 注入 nudge ──
+        # ── Level 3: 压缩上下文后重试（减少输入 token 压力） ──
+        time.sleep(0.5)
+        compressed_ctx = self.governor.govern(list(self._ctx))  # 强制再压缩一轮
+        try:
+            text, tcs, reasoning, finish_reason = _do_call(thinking=False, ctx_override=compressed_ctx)
+            if text or tcs:
+                return text, tcs
+        except Exception as e:
+            self._last_llm_error = f"[L3] {e}"
+
+        # ── Level 4: 关闭推理 + 注入 nudge ──
         time.sleep(0.5)
         nudge = {"role": "user",
                  "content": "请根据以上工具返回的信息，直接给出你的回答。"}
@@ -786,7 +1028,8 @@ class CortexAgent:
         try:
             text, tcs, reasoning, _ = _do_call(thinking=False)
             if reasoning: self._last_reasoning = reasoning
-        except Exception:
+        except Exception as e:
+            self._last_llm_error = f"[L4] {e}"
             text, tcs = None, None
         finally:
             if self._ctx and self._ctx[-1] is nudge:

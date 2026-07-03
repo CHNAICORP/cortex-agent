@@ -20,7 +20,13 @@ from typing import List, Dict, Optional, Tuple
 # ══════════════════════════════════════════════════════════════
 
 class MemoryStore:
-    """单文件持久化记忆。每行一条 markdown 列表项。"""
+    """单文件持久化记忆。每行一条 markdown 列表项。
+
+    设计原则:
+      - 记忆永久保留，不自动删除（用户显式 /forget 才删除）
+      - toSystemContext(max_entries) 控制注入到 LLM 上下文的条数
+      - 磁盘文件可无限增长，LLM 上下文注入量受控
+    """
 
     HEADER = "# Memory\n"
 
@@ -71,11 +77,22 @@ class MemoryStore:
         """列出所有记忆行。"""
         return self._read_lines()
 
-    def to_system_context(self) -> str:
-        """格式化为 system prompt 注入文本。"""
+    def count(self) -> int:
+        """返回记忆总条数。"""
+        return len(self._read_lines())
+
+    def to_system_context(self, max_entries: int = 30) -> str:
+        """格式化为 system prompt 注入文本。
+        
+        只注入最近 max_entries 条记忆，避免 system prompt 膨胀。
+        磁盘文件保留全部记忆，永不自动删除。
+        """
         lines = self._read_lines()
         if not lines:
             return ""
+        # 只取最近 max_entries 条注入
+        if len(lines) > max_entries:
+            lines = lines[-max_entries:]
         return "[记忆事实]\n" + "\n".join(lines)
 
 

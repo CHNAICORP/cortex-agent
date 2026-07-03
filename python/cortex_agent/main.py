@@ -60,17 +60,19 @@ def setup_wizard(config: 'AgentConfig', settings: dict) -> 'AgentConfig':
     t._w(f"{t.CYAN}{'='*50}{t.RESET}\n\n")
 
     # 1. Provider
-    providers = {"1": "deepseek", "2": "openai"}
+    providers = {"1": "deepseek", "2": "openai", "3": "glm"}
     t._w(f"  {t.YELLOW}选择模型提供商:{t.RESET}\n")
     t._w(f"    [1] DeepSeek (推荐，国内可用)\n")
     t._w(f"    [2] OpenAI\n")
-    choice = input(f"  {t.GREEN}请选择 (1/2):{t.RESET} ").strip() or "1"
+    t._w(f"    [3] GLM 智谱 (GLM-5.2，国产开源)\n")
+    choice = input(f"  {t.GREEN}请选择 (1/2/3):{t.RESET} ").strip() or "1"
     provider = providers.get(choice, "deepseek")
 
     # 2. API Key
     t._w(f"\n  {t.YELLOW}输入 API Key:{t.RESET}\n")
     t._w(f"  {t.GRAY}(DeepSeek: https://platform.deepseek.com/api_keys){t.RESET}\n")
     t._w(f"  {t.GRAY}(OpenAI: https://platform.openai.com/api-keys){t.RESET}\n")
+    t._w(f"  {t.GRAY}(GLM 智谱: https://open.bigmodel.cn/console/apikeys){t.RESET}\n")
     api_key = input(f"  {t.GREEN}API Key:{t.RESET} ").strip()
     while not api_key:
         t._w(f"  {t.RED}API Key 不能为空{t.RESET}\n")
@@ -78,7 +80,8 @@ def setup_wizard(config: 'AgentConfig', settings: dict) -> 'AgentConfig':
 
     # 3. Model
     models = {"deepseek": {"1": ("pro", "deepseek-v4-pro"), "2": ("flash", "deepseek-v4-flash")},
-              "openai": {"1": ("gpt-4o", "gpt-4o"), "2": ("gpt-4o-mini", "gpt-4o-mini")}}
+              "openai": {"1": ("gpt-4o", "gpt-4o"), "2": ("gpt-4o-mini", "gpt-4o-mini")},
+              "glm": {"1": ("glm-5.2", "glm-5.2"), "2": ("glm-5.2-flash", "glm-5.2-flash")}}
     t._w(f"\n  {t.YELLOW}选择模型:{t.RESET}\n")
     for k, (alias, name) in models.get(provider, {}).items():
         t._w(f"    [{k}] {alias} ({name})\n")
@@ -86,11 +89,14 @@ def setup_wizard(config: 'AgentConfig', settings: dict) -> 'AgentConfig':
     model_alias, model_name = models.get(provider, {}).get(m_choice, ("pro", "deepseek-v4-pro"))
 
     # 4. Save
+    _base_urls = {"deepseek": "https://api.deepseek.com/v1",
+                  "openai": "https://api.openai.com/v1",
+                  "glm": "https://open.bigmodel.cn/api/paas/v4"}
     user_path = os.path.join(os.path.expanduser("~"), ".cortx", "settings.json")
     new_settings = {
         "model": model_alias,
         "provider": provider,
-        "providers": {provider: {"api_key": api_key, "base_url": f"https://api.{provider}.com/v1",
+        "providers": {provider: {"api_key": api_key, "base_url": _base_urls[provider],
                                   "models": {model_alias: model_name}}},
         "max_steps": 10, "context_limit": 1000000, "max_tokens": 8192, "permission_mode": "standard",
         "auto_extract_memory": True, "memory_enabled": True, "sessions_enabled": True,
@@ -363,6 +369,7 @@ def main():
             ctx = agent.context_tokens
             lim = agent.context_limit
             pct = agent.context_pct
+            in_pct = agent.input_tokens_pct
             color = term.GREEN if pct < 50 else (term.YELLOW if pct < 80 else term.RED)
             msgs = len(agent._ctx)
             print(f"  {term.CYAN}═══ 上下文容量 ═══{term.RESET}")
@@ -371,6 +378,11 @@ def main():
             bar_len = 30; filled = int(bar_len * pct / 100)
             bar = f"{color}{'█' * filled}{term.GRAY}{'░' * (bar_len - filled)}{term.RESET}"
             print(f"  [{bar}]")
+            # Token 预算明细
+            print(f"  {term.CYAN}═══ Token 预算 ═══{term.RESET}")
+            print(f"  输入上限: {agent.max_input_tokens:,} tokens  (已用 {in_pct}%)")
+            print(f"  输出上限: {agent.max_tokens:,} tokens")
+            print(f"  上下文窗: {lim:,} tokens  (输入+输出+安全余量)")
             cs = agent.cache_stats
             if cs["calls"] > 0:
                 print(f"  {term.CYAN}═══ 缓存统计 ═══{term.RESET}")

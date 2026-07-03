@@ -22,6 +22,19 @@ export interface Settings {
   providers?: Record<string, { api_key?: string; base_url?: string; models?: Record<string, string> }>;
   permission_mode?: string;
   context_limit?: number;
+  max_tokens?: number;
+  max_input_tokens?: number;
+  // ── ContextGovernor 可调参数 ──
+  compress_threshold?: number;
+  compress_head?: number;
+  compress_tail?: number;
+  safety_margin?: number;
+  input_warn_pct?: number;
+  input_force_pct?: number;
+  // ── ToolExecutor 可调参数 ──
+  max_result_chars?: number;
+  // ── Memory 注入控制 ──
+  memory_inject_count?: number;
   max_steps?: number;
   work_dir?: string;
   [key: string]: unknown;
@@ -30,11 +43,11 @@ export interface Settings {
 function smartMerge(base: Record<string, unknown>, override: Record<string, unknown>): Record<string, unknown> {
   const result = { ...base };
   for (const [key, val] of Object.entries(override)) {
-    if (val === null || val === "" || val === 0 || val === undefined) {
-      // Empty values do not override (matching Python _smart_merge)
-      continue;
-    }
+    // Only skip truly empty values: null, undefined, empty string/array/object
+    // 0 and false are valid values that should override (matching Python fix)
+    if (val === null || val === undefined || val === "") continue;
     if (Array.isArray(val) && val.length === 0) continue;
+    if (typeof val === "object" && !Array.isArray(val) && val !== null && Object.keys(val).length === 0) continue;
     if (typeof val === "object" && !Array.isArray(val) && typeof result[key] === "object" && !Array.isArray(result[key]) && result[key] !== null) {
       result[key] = smartMerge(result[key] as Record<string, unknown>, val as Record<string, unknown>);
     } else {
@@ -66,7 +79,8 @@ export function loadSettings(): Settings {
   if (Object.keys(merged).length === 0 && !process.env.CORTEX_API_KEY) {
     const template: Record<string, unknown> = {
       model: "pro", provider: "deepseek",
-      providers: { deepseek: { api_key: "", base_url: "https://api.deepseek.com/v1", models: { flash: "deepseek-v4-flash", pro: "deepseek-v4-pro" } } },
+      providers: { deepseek: { api_key: "", base_url: "https://api.deepseek.com/v1", models: { flash: "deepseek-v4-flash", pro: "deepseek-v4-pro" } },
+                   glm: { api_key: "", base_url: "https://open.bigmodel.cn/api/paas/v4", models: {} } },
       web_search: {
         provider: "duckduckgo",          // duckduckgo | brave | serpapi | tavily
         brave_api_key: "",
@@ -75,7 +89,9 @@ export function loadSettings(): Settings {
         max_results: 5,
         timeout: 10,
       },
-      max_steps: 10, context_limit: 1000000, max_tokens: 8192, permission_mode: "standard",
+      max_steps: 10, context_limit: 0, max_tokens: 0, max_input_tokens: 0, permission_mode: "standard",
+      compress_threshold: 1500, compress_head: 600, compress_tail: 400, safety_margin: 4096,
+      input_warn_pct: 80, input_force_pct: 90, max_result_chars: 2000, memory_inject_count: 30,
       auto_extract_memory: true, memory_enabled: true, sessions_enabled: true,
     };
     fs.mkdirSync(path.dirname(user), { recursive: true });

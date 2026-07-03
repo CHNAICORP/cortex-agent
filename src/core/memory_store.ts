@@ -20,6 +20,8 @@ export class MemoryStore {
     this._ensure();
   }
 
+  /** 设计原则: 记忆永久保留，不自动删除。toSystemContext 控制注入量。 */
+
   private _ensure(): void {
     const dir = path.dirname(this.fpath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -64,10 +66,20 @@ export class MemoryStore {
     return this._readLines();
   }
 
-  toSystemContext(): string {
+  count(): number {
+    return this._readLines().length;
+  }
+
+  /**
+   * 格式化为 system prompt 注入文本。
+   * 只注入最近 maxEntries 条记忆，避免 system prompt 膨胀。
+   * 磁盘文件保留全部记忆，永不自动删除。
+   */
+  toSystemContext(maxEntries: number = 30): string {
     const lines = this._readLines();
     if (!lines.length) return "";
-    return "[记忆事实]\n" + lines.join("\n");
+    const inject = lines.length > maxEntries ? lines.slice(-maxEntries) : lines;
+    return "[记忆事实]\n" + inject.join("\n");
   }
 }
 

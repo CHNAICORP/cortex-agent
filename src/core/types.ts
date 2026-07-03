@@ -130,6 +130,18 @@ export interface AgentConfig {
   workspaceOnly: boolean;
   contextLimit: number;
   maxTokens: number;
+  maxInputTokens: number;
+  // ── ContextGovernor 可调参数 (均可在 settings.json 中自定义) ──
+  compressThreshold: number;
+  compressHead: number;
+  compressTail: number;
+  safetyMargin: number;
+  inputWarnPct: number;
+  inputForcePct: number;
+  // ── ToolExecutor 可调参数 ──
+  maxResultChars: number;
+  // ── Memory 注入控制 ──
+  memoryInjectCount: number;
 }
 
 export function defaultWorkDir(): string {
@@ -157,6 +169,18 @@ export const DEFAULT_CONFIG: AgentConfig = {
   permissionMode: "standard",
   permissionRemember: true,
   workspaceOnly: false,
-  contextLimit: 1_000_000,
-  maxTokens: 8192,
+  contextLimit: 0,
+  maxTokens: 0,
+  maxInputTokens: 0,
+  // ── ContextGovernor 可调参数 ──
+  compressThreshold: 1500,
+  compressHead: 600,
+  compressTail: 400,
+  safetyMargin: 4096,
+  inputWarnPct: 80,
+  inputForcePct: 90,
+  // ── ToolExecutor 可调参数 ──
+  maxResultChars: 2000,
+  // ── Memory 注入控制 ──
+  memoryInjectCount: 30,
 };

@@ -13,7 +13,7 @@ import {
 } from './types.js';
 import { registry } from './registry.js';
 import { PolicyEngine } from './policy.js';
-import { LLMProvider, ParsedToolCall } from './llm.js';
+import { LLMProvider, ParsedToolCall, resolveCapabilities } from './llm.js';
 export { LLMProvider } from './llm.js';
 import { MemoryStore, SessionStore } from './memory_store.js';
 
@@ -37,16 +37,38 @@ const DEFAULT_SYSTEM = [
 ].join("\n");
 
 // ── ContextGovernor ──
-class ContextGovernor {
+export class ContextGovernor {
   static TOKENS_PER_CHAR = 0.4;
+  /** 工具结果压缩阈值（字符数） */
+  static COMPRESS_THRESHOLD = 1500;
+  static COMPRESS_HEAD = 600;
+  static COMPRESS_TAIL = 400;
+  /** 安全余量：预留给 tokenizer 估算误差 + tool schema 开销 */
+  static SAFETY_MARGIN = 4096;
+  /** 输入 token 预警线（占 maxInputTokens 的百分比） */
+  static INPUT_WARN_PCT = 80;
+  static INPUT_FORCE_PCT = 90;
+
   system: Message;
   maxMsgs: number;
   contextLimit: number;
+  maxTokens: number;
+  maxInputTokens: number;
+  // 可调参数实例字段
+  compressThreshold: number;
+  compressHead: number;
+  compressTail: number;
+  safetyMargin: number;
+  inputWarnPct: number;
+  inputForcePct: number;
 
   constructor(opts: {
     system?: string; workDir?: string; maxMsgs?: number;
     memoryContext?: string; historySummary?: string;
     kbContext?: string; contextLimit?: number;
+    maxInputTokens?: number; maxTokens?: number;
+    compressThreshold?: number; compressHead?: number; compressTail?: number;
+    safetyMargin?: number; inputWarnPct?: number; inputForcePct?: number;
   }) {
     const parts: string[] = [opts.system || DEFAULT_SYSTEM];
     if (opts.kbContext) parts.push(`\n[项目知识库]\n${opts.kbContext}`);
@@ -56,6 +78,37 @@ class ContextGovernor {
     this.system = { role: "system", content: parts.join("\n") };
     this.maxMsgs = opts.maxMsgs || 24;
     this.contextLimit = opts.contextLimit || 1_000_000;
+    this.maxTokens = opts.maxTokens || 16384;
+    // 可调参数：使用传入值或回退到类常量默认值
+    this.compressThreshold = opts.compressThreshold || ContextGovernor.COMPRESS_THRESHOLD;
+    this.compressHead = opts.compressHead || ContextGovernor.COMPRESS_HEAD;
+    this.compressTail = opts.compressTail || ContextGovernor.COMPRESS_TAIL;
+    this.safetyMargin = opts.safetyMargin || ContextGovernor.SAFETY_MARGIN;
+    this.inputWarnPct = opts.inputWarnPct || ContextGovernor.INPUT_WARN_PCT;
+    this.inputForcePct = opts.inputForcePct || ContextGovernor.INPUT_FORCE_PCT;
+    // maxInputTokens: 0 = 自动计算 (contextLimit - maxTokens - SAFETY_MARGIN)
+    if (opts.maxInputTokens && opts.maxInputTokens > 0) {
+      this.maxInputTokens = opts.maxInputTokens;
+    } else {
+      this.maxInputTokens = Math.max(this.contextLimit - this.maxTokens - this.safetyMargin, 16000);
+    }
+  }
+
+  /** 压缩超长工具结果：保留首尾，中间用省略标记替代。 */
+  static compressResult(text: string, self?: ContextGovernor): string {
+    const threshold = self?.compressThreshold || ContextGovernor.COMPRESS_THRESHOLD;
+    const headLen = self?.compressHead || ContextGovernor.COMPRESS_HEAD;
+    const tailLen = self?.compressTail || ContextGovernor.COMPRESS_TAIL;
+    if (text.length <= threshold) return text;
+    const head = text.slice(0, headLen);
+    const tail = text.slice(-tailLen);
+    const omitted = text.length - headLen - tailLen;
+    return `${head}\n\n[...已压缩，省略 ${omitted} 字符...]\n\n${tail}`;
+  }
+
+  /** 实例方法版本，使用实例的可调参数。 */
+  compressResult(text: string): string {
+    return ContextGovernor.compressResult(text, this);
   }
 
   static estimateTokens(msgs: Message[]): number {
@@ -73,8 +126,16 @@ class ContextGovernor {
   }
 
   static contextPct(msgs: Message[], limit: number): number {
+    if (limit <= 0) return 0;
     const est = ContextGovernor.estimateTokens(msgs);
-    return Math.min(Math.floor(est / limit * 100), 99);
+    return Math.min(Math.floor(est / limit * 100), 100);
+  }
+
+  /** 当前输入 token 占 maxInputTokens 的百分比。 */
+  inputTokensPct(msgs: Message[]): number {
+    if (this.maxInputTokens <= 0) return 0;
+    const est = ContextGovernor.estimateTokens(msgs);
+    return Math.min(Math.floor(est / this.maxInputTokens * 100), 100);
   }
 
   static loadKb(projectDir: string): string {
@@ -94,42 +155,131 @@ class ContextGovernor {
     return ctx;
   }
 
+  /**
+   * 三重裁剪：条数裁剪 + tool result 压缩 + 输入 token 体积管控。
+   *
+   * 裁剪策略（与 Python 对齐）:
+   *   1. 按条数裁剪到 maxMsgs，保留最近一轮 tool_call+result 配对
+   *   2. 遍历保留的消息，对超长 tool result 执行首尾压缩
+   *   3. 输入 token 三级预警:
+   *      ≥80% maxInputTokens → 压缩所有 tool result
+   *      ≥90% maxInputTokens → 丢弃最早的非 system 消息
+   *      ≥100% maxInputTokens → 只保留 system + 最近 3 条
+   */
   govern(msgs: Message[]): Message[] {
-    if (msgs.length <= this.maxMsgs) return msgs;
-    const limit = this.maxMsgs - 1;
-    // Guard against corrupt contexts with very low maxMsgs
-    if (limit <= 0) {
-      // Keep system + last message
-      return [msgs[0], msgs[msgs.length - 1]];
+    // Step 1: 条数裁剪
+    let result: Message[];
+    if (msgs.length <= this.maxMsgs) {
+      result = [...msgs];
+    } else {
+      let limit = this.maxMsgs - 1;
+      let reserve = new Set<number>();
+      let hasPair = false;
+      for (let i = msgs.length - 1; i > 1; i--) {
+        if (msgs[i].role === "tool" && msgs[i - 1].tool_calls) {
+          reserve = new Set([i - 1, i]);
+          hasPair = true;
+          limit -= 2;
+          break;
+        }
+      }
+      const kept: Message[] = [];
+      for (let i = msgs.length - 1; i > 0 && kept.length < Math.max(limit, 0); i--) {
+        if (reserve.has(i)) continue;
+        kept.unshift(msgs[i]);
+      }
+      if (hasPair) {
+        const sorted = [...reserve].sort((a, b) => a - b);
+        kept.push(msgs[sorted[0]]);
+        kept.push(msgs[sorted[1]]);
+      }
+      const trimmed = msgs.length - 1 - kept.length;
+      if (trimmed > 0) {
+        kept.unshift({ role: "system", content: `[${trimmed}条历史已压缩]` });
+        while (kept.length > this.maxMsgs - 1) kept.splice(1, 1);
+      }
+      if (kept.length === 0) kept.push(msgs[msgs.length - 1]);
+      result = [msgs[0], ...kept];
     }
-    let reserve: Set<number> = new Set();
-    let hasPair = false;
-    for (let i = msgs.length - 1; i > 1; i--) {
-      if (msgs[i].role === "tool" && msgs[i - 1].tool_calls) {
-        reserve = new Set([i - 1, i]);
-        hasPair = true;
-        break;
+
+    // Step 2: 压缩超长 tool result
+    for (const m of result) {
+      if (m.role === "tool" && typeof m.content === "string" && m.content.length > this.compressThreshold) {
+        m.content = this.compressResult(m.content);
       }
     }
-    const kept: Message[] = [];
-    for (let i = msgs.length - 1; i > 0 && kept.length < Math.max(limit, 0); i--) {
-      if (reserve.has(i)) continue;
-      kept.unshift(msgs[i]);
+
+    // Step 3: 输入 token 体积管控（三级预警）
+    const inputTokens = ContextGovernor.estimateTokens(result);
+    const warnThreshold = Math.floor(this.maxInputTokens * this.inputWarnPct / 100);
+    const forceThreshold = Math.floor(this.maxInputTokens * this.inputForcePct / 100);
+
+    if (inputTokens >= this.maxInputTokens) {
+      // HARD: 只保留 system + 最近 3 条
+      if (result.length > 4) {
+        result = [result[0], ...result.slice(-3)];
+      }
+    } else if (inputTokens >= forceThreshold) {
+      // FORCE: 逐步丢弃最早的非 system 消息
+      while (result.length > 4 && ContextGovernor.estimateTokens(result) >= forceThreshold) {
+        result.splice(1, 1);
+      }
+      result.splice(1, 0, { role: "system", content: "[上下文压力过高，已强制裁剪历史]" });
+    } else if (inputTokens >= warnThreshold) {
+      // WARN: 强制压缩所有 tool result（包括未超阈值的）
+      for (const m of result) {
+        if (m.role === "tool" && typeof m.content === "string" && m.content.length > 200) {
+          m.content = this.compressResult(m.content);
+        }
+      }
     }
-    if (hasPair) {
-      const sorted = [...reserve].sort((a, b) => a - b);
-      kept.push(msgs[sorted[0]]);
-      kept.push(msgs[sorted[1]]);
+
+    // Step 4: 修复 tool_calls/tool 配对完整性
+    result = ContextGovernor._fixToolPairing(result);
+
+    return result;
+  }
+
+  /** 修复 tool_calls/tool 配对完整性 — 裁剪可能打破配对关系导致 API 报错。 */
+  static _fixToolPairing(msgs: Message[]): Message[] {
+    if (msgs.length === 0) return msgs;
+    const fixed: Message[] = [];
+    let i = 0;
+    while (i < msgs.length) {
+      const m = msgs[i];
+      if (m.role === "assistant" && m.tool_calls && m.tool_calls.length > 0) {
+        // 收集这个 assistant 消息之后所有连续的 tool 结果
+        const tcIds = new Set(m.tool_calls.map(tc => tc.id));
+        const toolResults: Message[] = [];
+        let j = i + 1;
+        while (j < msgs.length && msgs[j].role === "tool") {
+          toolResults.push(msgs[j]);
+          j++;
+        }
+        // 只保留 tool_call_id 在 tcIds 中的 tool 结果（过滤孤立结果）
+        const matchedResults = toolResults.filter(tr => tr.tool_call_id && tcIds.has(tr.tool_call_id));
+        const matchedIds = new Set(matchedResults.map(tr => tr.tool_call_id));
+        if (matchedIds.size > 0) {
+          // 只保留有结果的 tool_calls
+          const keptTcs = m.tool_calls.filter(tc => matchedIds.has(tc.id));
+          const newM: Message = { ...m, tool_calls: keptTcs };
+          fixed.push(newM);
+          fixed.push(...matchedResults);
+        } else {
+          // 没有任何匹配的 tool 结果 → 移除 tool_calls，保留 content
+          const { tool_calls, ...rest } = m;
+          if (rest.content) fixed.push(rest);
+        }
+        i = j;
+      } else if (m.role === "tool") {
+        // 孤立的 tool 消息（前面没有带 tool_calls 的 assistant）→ 跳过
+        i++;
+      } else {
+        fixed.push(m);
+        i++;
+      }
     }
-    const trimmed = msgs.length - 1 - kept.length;
-    if (trimmed > 0) {
-      kept.unshift({ role: "system", content: `[${trimmed}条历史已压缩]` });
-      while (kept.length > this.maxMsgs - 1) kept.splice(1, 1);
-    }
-    if (kept.length === 0) {
-      kept.push(msgs[msgs.length - 1]);
-    }
-    return [msgs[0], ...kept];
+    return fixed;
   }
 }
 
@@ -154,16 +304,18 @@ class Observer {
 }
 
 // ── ToolExecutor ──
-class ToolExecutor {
-  static MAX_RESULT_CHARS = 3000;
+export class ToolExecutor {
+  static MAX_RESULT_CHARS = 2000;
   private reg: typeof registry;
   private workDir: string;
   private timeout: number;
+  maxResultChars: number;
 
-  constructor(workDir: string, timeout = 10) {
+  constructor(workDir: string, timeout = 10, maxResultChars = 0) {
     this.reg = registry;
     this.workDir = workDir;
     this.timeout = timeout;
+    this.maxResultChars = maxResultChars > 0 ? maxResultChars : ToolExecutor.MAX_RESULT_CHARS;
   }
 
   execute(name: string, args: Record<string, unknown>): string | Promise<string> {
@@ -180,11 +332,16 @@ class ToolExecutor {
     }
   }
 
+  /**
+   * 智能截断：保留首尾，中间省略（与 Python 对齐）。
+   * head = 2/3, tail = 1/3
+   */
   private truncate(result: string): string {
-    if (result.length > ToolExecutor.MAX_RESULT_CHARS) {
-      return result.slice(0, ToolExecutor.MAX_RESULT_CHARS) + `\n\n[...已截断，原${result.length}字符]`;
-    }
-    return result;
+    if (result.length <= this.maxResultChars) return result;
+    const head = Math.floor(this.maxResultChars * 2 / 3);
+    const tail = Math.floor(this.maxResultChars / 3);
+    const omitted = result.length - head - tail;
+    return `${result.slice(0, head)}\n\n[...已截断，省略 ${omitted} 字符...]\n\n${result.slice(-tail)}`;
   }
 }
 
@@ -201,6 +358,7 @@ export class CortexAgent {
   private observer = new Observer();
   private ctx: Message[] = [];
   private trace: RunTrace | null = null;
+  private lastLlmError = "";
   private rejectionCounts = new Map<Capability, number>();
   private suspendedCaps = new Set<Capability>();
   private permissionDecisions = new Map<string, boolean>();
@@ -233,7 +391,7 @@ export class CortexAgent {
     }
 
     this.policy = new PolicyEngine(wd, { permissionMode: this.config.permissionMode });
-    this.executor = new ToolExecutor(wd, this.config.toolTimeout);
+    this.executor = new ToolExecutor(wd, this.config.toolTimeout, this.config.maxResultChars);
 
     // ── 记忆 + 会话存储 ──
     const memoryPath = this.config.memoryDir || path.join(wd, "memory.md");
@@ -241,10 +399,17 @@ export class CortexAgent {
     this._memory = this.config.memoryEnabled ? new MemoryStore(memoryPath) : null;
     this._sessions = this.config.sessionsEnabled ? new SessionStore(sessionsDir) : null;
 
+    // ── Model capabilities auto-resolve ──
+    // contextLimit=0 或 maxTokens=0 时，从模型能力注册表自动解析
+    const resolvedModel = LLMProvider.resolve(this.config.model);
+    const caps = resolveCapabilities(resolvedModel);
+    if (this.config.contextLimit === 0) this.config.contextLimit = caps.contextWindow;
+    if (this.config.maxTokens === 0) this.config.maxTokens = caps.maxOutputTokens;
+
     this.llm = new LLMProvider({
       apiKey: this.config.apiKey,
       baseUrl: this.config.baseUrl,
-      model: LLMProvider.resolve(this.config.model),
+      model: resolvedModel,
       tools: registry.schemaList,
       timeout: this.config.thinkTimeout,
       maxTokens: this.config.maxTokens,
@@ -254,7 +419,13 @@ export class CortexAgent {
 
   private _makeGovernor(): void {
     const kb = ContextGovernor.loadKb(process.cwd());
-    const memoryCtx = this._memory?.toSystemContext() || "";
+    // 动态记忆注入：根据记忆条数控制注入量
+    let memoryCtx = "";
+    if (this._memory) {
+      const total = this._memory.count();
+      const injectN = total > this.config.memoryInjectCount ? this.config.memoryInjectCount : total;
+      memoryCtx = this._memory.toSystemContext(injectN);
+    }
     const historySummary = (this._sessions && this.sessionId)
       ? (this._sessions.getHistorySummary(this.sessionId) || "") : "";
     this.governor = new ContextGovernor({
@@ -265,6 +436,14 @@ export class CortexAgent {
       historySummary: historySummary,
       kbContext: kb,
       contextLimit: this.config.contextLimit,
+      maxInputTokens: this.config.maxInputTokens,
+      maxTokens: this.config.maxTokens,
+      compressThreshold: this.config.compressThreshold,
+      compressHead: this.config.compressHead,
+      compressTail: this.config.compressTail,
+      safetyMargin: this.config.safetyMargin,
+      inputWarnPct: this.config.inputWarnPct,
+      inputForcePct: this.config.inputForcePct,
     });
   }
 
@@ -319,6 +498,9 @@ export class CortexAgent {
   get lastTrace(): RunTrace | null { return this.trace; }
 
   get contextLimit(): number { return this.config.contextLimit; }
+  get maxInputTokens(): number { return this.governor.maxInputTokens; }
+  get maxTokens(): number { return this.config.maxTokens; }
+  get inputTokensPct(): number { return this.governor.inputTokensPct(this.ctx); }
 
   /** @internal Public for CLI access — matches Python's public attribute */
   get sessions(): SessionStore | null { return this._sessions; }
@@ -326,6 +508,13 @@ export class CortexAgent {
 
   switchModel(alias: string): void {
     this.llm.switch(alias); this.config.model = this.llm.model;
+    // 重新解析模型能力，更新 contextLimit 和 maxTokens
+    const caps = resolveCapabilities(this.llm.model);
+    this.config.contextLimit = caps.contextWindow;
+    this.config.maxTokens = caps.maxOutputTokens;
+    this.llm.updateMaxTokens(this.config.maxTokens);
+    // 重建 governor 以应用新的上下文窗口
+    this._makeGovernor();
   }
 
   switchPermissionMode(mode: string): string {
@@ -498,7 +687,8 @@ export class CortexAgent {
       this.ctx = this.governor.govern(this.ctx);
       const { text, toolCalls, reasoning } = await this._think();
       if (text === null && !toolCalls) {
-        this.trace.error = "LLM 调用失败（空响应，已重试3次+注入提示）";
+        const err = this.lastLlmError || "未知错误";
+        this.trace.error = `LLM 调用失败: ${err}`;
         if (this.term) {
           this.term.closeThinking();
           this.term.write(`\n${this.trace.error}\n`);
@@ -556,8 +746,16 @@ export class CortexAgent {
           }
         }
         let result: string;
-        if (!ok) { result = reason; }
-        else { result = await Promise.resolve(this.executor.execute(tc.name, tc.args)); }
+        if (!ok) {
+          result = reason;
+        } else if (reason.startsWith(PolicyEngine.WARN_PREFIX)) {
+          // WARN tier: execute but annotate warning to LLM context (与 Python 对齐)
+          const warnMsg = reason.slice(PolicyEngine.WARN_PREFIX.length);
+          result = await Promise.resolve(this.executor.execute(tc.name, tc.args));
+          result = `[注意: ${warnMsg}]\n${result}`;
+        } else {
+          result = await Promise.resolve(this.executor.execute(tc.name, tc.args));
+        }
 
         const latency = Date.now() - t0;
         if (this.term) this.term.toolDone(ok, latency, result);
@@ -620,23 +818,28 @@ export class CortexAgent {
     text: string | null; toolCalls: ParsedToolCall[] | null; reasoning: string;
   }> {
     /**
-     * Think 阶段 — 调用 LLM，带渐进降级恢复。
+     * Think 阶段 — 调用 LLM，带输入压力感知的渐进降级恢复。
      *
-     * 3 级降级策略（每级改变策略，不做无意义重试）:
+     * 4 级降级策略（每级改变策略+减少输入压力，与 Python 对齐）:
      *   Level 1: thinking=true  — 正常推理模式
      *   Level 2: thinking=false — 关闭推理，全部 token 留给 content/tool_calls
-     *   Level 3: thinking=false + nudge — 注入提示消息强制生成回答
+     *   Level 3: thinking=false + 强制 govern — 压缩历史 tool result 后重试
+     *   Level 4: thinking=false + nudge — 注入提示消息强制生成回答
+     *
+     * 所有异常被捕获并记录到 this.lastLlmError，不静默吞掉。
      */
+    this.lastLlmError = "";
 
-    const doCall = async (thinking: boolean = true) => {
+    const doCall = async (thinking: boolean = true, ctxOverride?: Message[]) => {
+      const ctx = ctxOverride || this.ctx;
       if (this.term) {
-        return this.llm.callStream(this.ctx,
+        return this.llm.callStream(ctx,
           t => this.term!.thinkToken(t),
           t => this.term!.answerToken(t),
           thinking,
         );
       }
-      return this.llm.call(this.ctx, thinking);
+      return this.llm.call(ctx, thinking);
     };
 
     // ── Level 1: 正常推理模式 ──
@@ -645,7 +848,7 @@ export class CortexAgent {
       if (text || toolCalls) {
         return { text, toolCalls, reasoning };
       }
-    } catch { /* fall through */ }
+    } catch (e: any) { this.lastLlmError = `[L1] ${e?.message || e}`; /* fall through */ }
 
     // ── Level 2: 关闭推理模式（解决 finishReason=length） ──
     await new Promise(r => setTimeout(r, 500));
@@ -654,21 +857,37 @@ export class CortexAgent {
       if (text || toolCalls) {
         return { text, toolCalls, reasoning: "" };
       }
-    } catch { /* fall through */ }
+    } catch (e: any) { this.lastLlmError = `[L2] ${e?.message || e}`; /* fall through */ }
 
-    // ── Level 3: 关闭推理 + 注入 nudge ──
+    // ── Level 3: 压缩上下文后重试（减少输入 token 压力） ──
+    await new Promise(r => setTimeout(r, 500));
+    const compressedCtx = this.governor.govern([...this.ctx]);
+    try {
+      const { text, toolCalls } = await doCall(false, compressedCtx);
+      if (text || toolCalls) {
+        return { text, toolCalls, reasoning: "" };
+      }
+    } catch (e: any) { this.lastLlmError = `[L3] ${e?.message || e}`; /* fall through */ }
+
+    // ── Level 4: 关闭推理 + 注入 nudge ──
     await new Promise(r => setTimeout(r, 500));
     const nudge: Message = { role: "user", content: "请根据以上工具返回的信息，直接给出你的回答。" };
     this.ctx.push(nudge);
+    let l4Text: string | null = null;
+    let l4Tcs: ParsedToolCall[] | null = null;
+    let l4Reasoning = "";
     try {
       const { text, toolCalls, reasoning } = await doCall(false);
+      l4Text = text; l4Tcs = toolCalls; l4Reasoning = reasoning;
+    } catch (e: any) { this.lastLlmError = `[L4] ${e?.message || e}`; }
+    // 使用 finally 模式确保 nudge 只被 pop 一次（与 Python 对齐）
+    if (this.ctx.length > 0 && this.ctx[this.ctx.length - 1] === nudge) {
       this.ctx.pop();
-      if (text || toolCalls) {
-        return { text, toolCalls, reasoning };
-      }
-    } catch { /* ignore */ }
-    this.ctx.pop();
+    }
 
+    if (l4Text || l4Tcs) {
+      return { text: l4Text, toolCalls: l4Tcs, reasoning: l4Reasoning };
+    }
     return { text: null, toolCalls: null, reasoning: "" };
   }
 }
