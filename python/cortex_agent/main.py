@@ -98,7 +98,7 @@ def setup_wizard(config: 'AgentConfig', settings: dict) -> 'AgentConfig':
         "provider": provider,
         "providers": {provider: {"api_key": api_key, "base_url": _base_urls[provider],
                                   "models": {model_alias: model_name}}},
-        "max_steps": 10, "context_limit": 1000000, "max_tokens": 8192, "permission_mode": "standard",
+        "max_steps": 50, "context_limit": 1000000, "max_tokens": 8192, "permission_mode": "standard",
         "auto_extract_memory": True, "memory_enabled": True, "sessions_enabled": True,
     }
     os.makedirs(os.path.dirname(user_path), exist_ok=True)
@@ -125,7 +125,9 @@ def main():
     p.add_argument("--update", action="store_true", help="更新 cortx 到最新版本")
     p.add_argument("--model", default=None, help="模型别名 (覆盖 settings.json)")
     p.add_argument("--work-dir", default=None, help="工作目录")
-    p.add_argument("--max-steps", type=int, default=10)
+    p.add_argument("--max-steps", type=int, default=50)
+    p.add_argument("--long", action="store_true", help="长时运行模式（自动续行直到完成）")
+    p.add_argument("--max-rounds", type=int, default=None, help="限制续行轮数（0=无限）")
     p.add_argument("--no-stream", action="store_true", help="关闭流式输出")
     p.add_argument("--query","-q", default=None, help="单次查询")
     p.add_argument("--resume", default=None, metavar="SESSION_ID", help="恢复到指定会话")
@@ -512,7 +514,7 @@ def main():
                 if args.no_stream: print(ans)
             continue
         try:
-            ans = agent.run(q, max_steps=args.max_steps, keep_history=True)
+            ans = agent.run_long(q, max_rounds=args.max_rounds) if args.long else agent.run(q, max_steps=args.max_steps, keep_history=True)
             if args.no_stream: print(ans)
         except KeyboardInterrupt:
             print(f"\n{term.YELLOW}中断{term.RESET}")

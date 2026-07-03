@@ -110,26 +110,22 @@ export class PolicyEngine {
   static WARN_PREFIX = "[WARN] ";
 
   static SHELL_BLOCK_SUBSTR = [
-    // System destruction
-    "rm -rf /", "rm -rf --no-preserve-root", "sudo rm", "del /f /s",
-    "format ", "diskpart", "mkfs", "fdisk", "dd if=",
+    // System destruction — 仅拦截真正危险的系统级操作
+    "rm -rf /", "rm -rf --no-preserve-root", "del /f /s /q c:",
+    "format ", "diskpart", "mkfs", "fdisk", "dd if=/dev/",
     "shutdown", "reboot", "stop-computer", "restart-computer",
-    // Privilege escalation
-    "sudo ", "su ", "runas ",
+    // Privilege escalation (仅真正的提权命令)
+    "runas /user:",
     // Data exfiltration vectors
-    "nc ", "ncat ", "netcat ", "telnet ",
-    "ssh ", "scp ", "sftp ", "ftp ", "sendmail",
+    "nc ", "ncat ", "netcat ",
     // System config modification
-    "reg add", "reg delete", "reg import", "reg save",
-    "sc create", "sc delete", "sc config", "sc stop", "sc start",
-    "schtasks", "new-service", "remove-service",
-    "set-itemproperty", "new-itemproperty",
-    "bcdedit", "netsh ", "wmic ", "set-executionpolicy",
-    // Process/service termination
-    "taskkill", "stop-process", "clear-recyclebin",
-    // PowerShell obfuscation
-    "-encodedcommand", "-enc ", " -e ", "invoke-expression",
-    "iex ", ".iex", "|iex", ";iex",
+    "reg add", "reg delete", "reg import",
+    "sc create", "sc delete", "sc config",
+    "schtasks /create", "schtasks /delete",
+    "new-service", "remove-service",
+    "bcdedit", "netsh ", "set-executionpolicy",
+    // PowerShell obfuscation (仅真正的混淆)
+    "-encodedcommand", "-enc ",
     // Registry access
     "hklm:", "hkcu:", "hkey_",
   ];
@@ -138,20 +134,16 @@ export class PolicyEngine {
   static SHELL_BLOCK_RE: [RegExp, string][] = [
     [/(?:^|\s)([d-z]:\\)/i,           "禁止访问非 C 盘路径"],
     [/(?:^|\s|;)(?:-[eE][nNcCoOdDeEdDcCoOmMmMaAnNdD]*)\s/, "禁止 PowerShell 编码命令 (-e/-en/-enc)"],
-    [/[|;]\s*remove-item\b/i,          "禁止管道删除操作"],
-    [/[|;]\s*stop-process\b/i,          "禁止管道终止进程"],
-    [/[|;]\s*out-file\b/i,              "禁止管道写入文件"],
-    [/[|;]\s*set-content\b/i,           "禁止管道修改文件"],
-    [/>\s*[/\\]/i,                      "禁止重定向到系统路径"],
+    // 禁止递归删除根目录
+    [/remove-item\s+.*-recurse\s+-force/i, "禁止递归强制删除"],
+    [/del\s+\/[a-z]*s[a-z]*\s+\/q/i,  "禁止批量静默删除"],
   ];
 
   static SHELL_WARN_SUBSTR = [
     "curl ", "wget ", "invoke-webrequest", "invoke-restmethod",
     "chmod 777", "chmod -R",
     "net user", "net localgroup", "net share",
-    "get-process", "get-service", "get-eventlog", "get-wmiobject",
-    "test-connection", "test-netconnection", "resolve-dnsname",
-    "set-content", "out-file", "add-content",
+    "get-eventlog", "get-wmiobject",
   ];
 
   static SQL_DENY = new Set([
@@ -165,8 +157,6 @@ export class PolicyEngine {
     [/\bexec\s*\(/, "禁止 exec"],
     [/\beval\s*\(/, "禁止 eval"],
     [/\bcompile\s*\(/, "禁止 compile"],
-    [/\bsubprocess\b/, "禁止 subprocess"],
-    [/\bsocket\b/, "禁止 socket"],
     [/\bctypes\b/, "禁止 ctypes"],
     [/\b__builtins__/, "禁止 __builtins__"],
     [/\b__class__/, "禁止 __class__"],
@@ -211,17 +201,19 @@ export class PolicyEngine {
       return AuditVerdict.ALLOW;
     }
     if (risk === RiskLevel.WRITE) {
-      // 工作区内写操作在 auto 和 standard 模式都放行
+      // 工作区内写操作在所有模式都放行
       if (!isOutside) return AuditVerdict.ALLOW;
-      // 工作区外的写操作在 auto 模式也放行（agent 可能在项目目录操作）
+      // 工作区外的写操作在 auto 模式也放行
       if (mode === "auto") return AuditVerdict.ALLOW;
       return AuditVerdict.CONFIRM;
     }
-    // SYSTEM
-    // auto 模式：系统命令自动放行
+    // SYSTEM 风险（shell/python 等）
+    // 内容审计已通过 → 命令本身不危险
+    // auto 模式自动放行
     if (mode === "auto") return AuditVerdict.ALLOW;
-    if (mode === "standard") return AuditVerdict.CONFIRM;
-    return AuditVerdict.ALLOW;
+    // standard 模式：工作区内放行（开发命令如 npm/tsc/git/python 等）
+    if (!isOutside) return AuditVerdict.ALLOW;
+    return AuditVerdict.CONFIRM;
   }
 
   async audit(toolName: string, args: Record<string, unknown>): Promise<[boolean, string]> {

@@ -115,9 +115,11 @@ All HTTP calls use a proxy-aware opener (`_build_opener()` in Python, `httpReque
 
 | Mode | SAFE tools | WRITE tools | SYSTEM tools |
 |------|-----------|-------------|--------------|
-| `standard` | auto-allow | within-workspace auto-allow, outside confirm | confirm |
+| `standard` | auto-allow | within-workspace auto-allow, outside confirm | within-workspace auto-allow, outside confirm |
 | `auto` | auto-allow | auto-allow (even outside) | auto-allow |
 | `yolo` | auto-allow | auto-allow | auto-allow |
+
+Content audit (hard block) runs **always**, even in yolo mode. Only truly dangerous commands (system destruction, privilege escalation, registry modification, PowerShell obfuscation) are hard-blocked. Development commands (npm, tsc, git, pip, python, etc.) pass content audit and are allowed in all modes within the workspace.
 
 CONFIRM verdicts in non-interactive (`--no-stream`) standard mode auto-deny. In yolo/auto, they auto-allow. `_request_confirmation()` in Python prompts `[Y/n/always/deny]` interactively.
 

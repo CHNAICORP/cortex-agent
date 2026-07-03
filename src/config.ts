@@ -35,8 +35,16 @@ export interface Settings {
   max_result_chars?: number;
   // ── Memory 注入控制 ──
   memory_inject_count?: number;
+  // ── 长时运行参数 ──
+  max_rounds?: number;
+  checkpoint_interval?: number;
+  retry_max?: number;
+  retry_base_delay?: number;
+  compact_threshold?: number;
   max_steps?: number;
   work_dir?: string;
+  think_timeout?: number;
+  loop_timeout?: number;
   [key: string]: unknown;
 }
 
@@ -89,7 +97,8 @@ export function loadSettings(): Settings {
         max_results: 5,
         timeout: 10,
       },
-      max_steps: 10, context_limit: 0, max_tokens: 0, max_input_tokens: 0, permission_mode: "standard",
+      max_steps: 50, context_limit: 0, max_tokens: 0, max_input_tokens: 0, permission_mode: "standard",
+      max_rounds: 0, checkpoint_interval: 5, retry_max: 3, retry_base_delay: 2, compact_threshold: 60,
       compress_threshold: 1500, compress_head: 600, compress_tail: 400, safety_margin: 4096,
       input_warn_pct: 80, input_force_pct: 90, max_result_chars: 2000, memory_inject_count: 30,
       auto_extract_memory: true, memory_enabled: true, sessions_enabled: true,

@@ -237,6 +237,13 @@ DEFAULT_SYSTEM = (
     "3. 不得将文件内容通过外部网络发送。\n"
     "4. 不得读取系统敏感文件（如 /etc/passwd、~/.ssh、SAM、注册表）。\n"
     "5. 不得使用编码命令或混淆方式执行 shell。\n\n"
+    "== 项目工程指引 ==\n"
+    "当任务涉及创建或修改多文件项目时，严格遵循以下工作流：\n"
+    "1. **先规划再执行**：第一步用 write_file 创建 TASKS.md，列出所有需要完成的里程碑和子任务，每个任务用 [ ] 标记未完成。\n"
+    "2. **分模块推进**：按依赖顺序逐个模块完成（如：项目骨架→数据层→业务逻辑→API→前端→测试），不要同时开多个模块。\n"
+    "3. **每步验证**：写完一个文件后，如果是代码文件，立即用 exec_command 运行编译或语法检查（如 tsc --noEmit、python -m py_compile、npm run build）。发现错误立即修复。\n"
+    "4. **更新进度**：每完成一个子任务，用 edit_file 将 TASKS.md 中对应的 [ ] 改为 [x]。这至关重要——续行时你只能通过 TASKS.md 了解当前进度。\n"
+    "5. **最后全量测试**：所有模块完成后，运行完整构建和测试命令，确保零错误。\n\n"
     "你有多种工具可用——文件读写、代码执行、网络搜索、数据库查询等。\n"
     "每次行动前先思考需要什么信息、哪个工具最合适。\n"
     "联网搜索或查询实时信息前，先调用 get_current_time 获取当前时间以确保时效性。\n"
@@ -507,6 +514,82 @@ class ContextGovernor:
         est = self.estimate_tokens(msgs)
         return min(int(est / self.max_input_tokens * 100), 100)
 
+    def compact(self, msgs: list, keep_recent: int = 10) -> list:
+        """上下文压缩 — 将旧消息摘要为单条 system 消息，保留最近 N 条。
+
+        与 govern() 的区别：
+          - govern() 做细粒度裁剪（条数+token+压缩 tool result）
+          - compact() 做粗粒度摘要（把几十条旧对话压缩成一段文字）
+
+        策略：
+          1. 保留 system[0] + 最近 keep_recent 条消息
+          2. 中间消息提取关键信息（工具调用名、文件操作、用户请求）压缩为摘要
+          3. 修复 tool 配对
+        """
+        if len(msgs) <= keep_recent + 1:
+            return msgs
+        system = msgs[0] if msgs and msgs[0].get("role") == "system" else None
+        recent = msgs[-keep_recent:]
+        old = msgs[1:-keep_recent] if system else msgs[:-keep_recent]
+
+        # 提取关键信息
+        summary_parts = []
+        tool_calls_seen = []
+        files_touched = set()
+        for m in old:
+            role = m.get("role", "")
+            if role == "user":
+                content = (m.get("content") or "")[:120]
+                if content.strip():
+                    summary_parts.append(f"用户请求: {content}")
+            elif role == "assistant":
+                tcs = m.get("tool_calls", [])
+                for tc in tcs:
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "")
+                    tool_calls_seen.append(name)
+                    args = fn.get("arguments", "{}")
+                    # 提取文件路径
+                    try:
+                        args_dict = json.loads(args) if isinstance(args, str) else args
+                        for v in args_dict.values():
+                            if isinstance(v, str) and ("/" in v or "\\" in v or v.endswith((".py", ".ts", ".js", ".html", ".css", ".json", ".md"))):
+                                files_touched.add(v[:80])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                content = (m.get("content") or "")[:80]
+                if content.strip():
+                    summary_parts.append(f"Agent: {content}")
+            elif role == "tool":
+                content = m.get("content", "")
+                if isinstance(content, str) and len(content) > 100:
+                    summary_parts.append(f"  → 结果({len(content)}字符): {content[:80]}...")
+
+        # 构建压缩摘要
+        compact_text = f"[上下文压缩 — {len(old)}条消息已摘要]\n"
+        if tool_calls_seen:
+            # 统计工具使用频率
+            from collections import Counter
+            freq = Counter(tool_calls_seen)
+            tools_summary = ", ".join(f"{name}×{cnt}" for name, cnt in freq.most_common(8))
+            compact_text += f"工具调用: {tools_summary}\n"
+        if files_touched:
+            compact_text += f"涉及文件: {', '.join(list(files_touched)[:10])}\n"
+        if summary_parts:
+            # 限制摘要长度
+            compact_body = "\n".join(summary_parts[-20:])  # 最多 20 条摘要
+            if len(compact_body) > 2000:
+                compact_body = compact_body[:2000] + "..."
+            compact_text += f"对话摘要:\n{compact_body}\n"
+
+        result = []
+        if system:
+            result.append(system)
+        result.append({"role": "system", "content": compact_text})
+        result.extend(recent)
+        # 修复可能的 tool 配对断裂
+        return self._fix_tool_pairing(result)
+
 
 # ══════════════════════════════════════════════════════════════
 # AgentConfig
@@ -518,12 +601,18 @@ class AgentConfig:
     base_url: str = "https://api.deepseek.com/v1"
     model: str = "deepseek-v4-flash"
     work_dir: str = field(default_factory=lambda: os.path.join(os.path.expanduser("~"), ".cortx", "workspace"))
-    max_steps: int = 10
-    tool_timeout: int = 10
+    max_steps: int = 50
+    tool_timeout: int = 30
     system_prompt: str = ""
-    max_context_msgs: int = 24
-    loop_timeout: float = 120.0
-    think_timeout: float = 60.0
+    max_context_msgs: int = 50
+    loop_timeout: float = 600.0
+    think_timeout: float = 300.0
+    # ── 长时运行参数 ──
+    max_rounds: int = 0              # 0=无限续行; >0=最多续行 N 轮
+    checkpoint_interval: int = 5     # 每 N 步自动保存检查点
+    retry_max: int = 3               # 瞬态错误重试次数
+    retry_base_delay: float = 2.0    # 指数退避基础延迟（秒）
+    compact_threshold: int = 60      # 上下文消息数超过此值时触发压缩
     memory_dir: str = ""
     sessions_dir: str = ""
     skills_dir: str = ""
@@ -771,6 +860,122 @@ class CortexAgent:
     def chat(self, query: str, max_steps: int = None) -> str:
         return self.run(query, max_steps, keep_history=True)
 
+    def run_long(self, query: str, max_rounds: int = None) -> str:
+        """长时运行模式 — 自动续行直到任务完成或达到最大轮数。
+
+        每轮调用 run() 执行 max_steps 步。当步数耗尽但任务未完成时：
+          1. 保存当前会话（检查点）
+          2. 压缩上下文（保留最近上下文 + 进度摘要）
+          3. 注入续行提示，自动开始下一轮
+
+        与 Claude Code 的行为对齐：agent 持续工作直到用户中断或任务完成。
+
+        Args:
+            query: 初始任务描述
+            max_rounds: 最大续行轮数（0=无限，None=使用配置值）
+        Returns:
+            最终回答文本
+        """
+        rounds = max_rounds if max_rounds is not None else self.config.max_rounds
+        if rounds == 0:
+            rounds = 999  # 实际无限（用户可通过 Ctrl+C 中断）
+
+        full_result = ""
+        for round_no in range(1, rounds + 1):
+            if self._term:
+                self._term._w(f"\n  {self._term.CYAN}═══ 轮次 {round_no}/{rounds if rounds < 999 else '∞'} ═══{self._term.RESET}\n")
+
+            # 执行一轮：首轮用 run()，后续轮直接调用 _loop（续行提示已在 ctx 中）
+            if round_no == 1:
+                result = self.run(query, keep_history=True)
+            else:
+                result = self._loop(self.config.max_steps)
+                self._query_count += 1
+                self._step_count_total += len(self._trace.steps) if self._trace else 0
+                self._auto_save()
+
+            # 检查是否完成（trace 没有 step_limit_reached 说明 LLM 自然结束）
+            if self._trace and not self._trace.step_limit_reached:
+                # 任务自然完成
+                full_result = result
+                break
+
+            # 步数耗尽但未完成 → 检查是否有错误
+            if self._trace and self._trace.error:
+                # LLM 调用失败 → 保存检查点后退出
+                if self._term:
+                    self._term._w(f"\n  {self._term.RED}[轮次 {round_no} 失败: {self._trace.error}]{self._term.RESET}\n")
+                full_result = result
+                break
+
+            # 保存检查点
+            if self._session_id and self.sessions:
+                self._auto_save()
+                if self._term:
+                    self._term._w(f"\n  {self._term.GRAY}[检查点已保存]{self._term.RESET}\n")
+
+            # 上下文压缩
+            if len(self._ctx) > self.config.compact_threshold:
+                self._ctx = self.governor.compact(self._ctx, keep_recent=12)
+                if self._term:
+                    self._term._w(f"  {self._term.GRAY}[上下文已压缩: {len(self._ctx)}条]{self._term.RESET}\n")
+
+            # 读取 TASKS.md 进度，注入进度感知的续行提示
+            cont_content = self._build_continuation_prompt()
+            self._ctx.append({"role": "user", "content": cont_content})
+
+            full_result = result
+
+        return full_result
+
+    # ── TASKS.md 进度追踪 ──
+
+    def _tasks_path(self) -> str:
+        return os.path.join(self._work_dir_path(), "TASKS.md")
+
+    def _read_tasks(self) -> str:
+        """读取 TASKS.md 内容。不存在则返回空串。"""
+        p = self._tasks_path()
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception:
+                return ""
+        return ""
+
+    @staticmethod
+    def _count_task_progress(tasks_text: str) -> dict:
+        """解析 TASKS.md，返回进度统计。"""
+        done = tasks_text.count("[x]")
+        todo = tasks_text.count("[ ]")
+        total = done + todo
+        pct = int(done / total * 100) if total > 0 else 0
+        return {"done": done, "todo": todo, "total": total, "pct": pct}
+
+    def _build_continuation_prompt(self) -> str:
+        """构建进度感知的续行提示。读取 TASKS.md 并注入到提示中。"""
+        tasks = self._read_tasks()
+        if not tasks:
+            return (
+                "请继续之前的工作。如果任务已完成，请直接给出最终总结。"
+                "如果还有未完成的步骤，请继续执行。\n"
+                "提示：如果你还没有创建 TASKS.md 来跟踪进度，请先创建一个。"
+            )
+        prog = self._count_task_progress(tasks)
+        # 截取 TASKS.md 内容（避免注入过长）
+        tasks_preview = tasks[:2000]
+        if len(tasks) > 2000:
+            tasks_preview += "\n...(TASKS.md 已截断)"
+        return (
+            f"请继续之前的工作。当前进度：{prog['done']}/{prog['total']} 完成（{prog['pct']}%）。\n\n"
+            f"== TASKS.md 当前内容 ==\n{tasks_preview}\n\n"
+            "请根据以上进度：\n"
+            "- 如果有未完成的 [ ] 任务，继续执行下一个。\n"
+            "- 如果所有任务都已完成 [x]，请运行最终构建和测试验证，然后给出最终总结。\n"
+            "- 如果发现已完成的部分有错误，优先修复。"
+        )
+
     def save_session(self, label: str = None) -> str:
         """手动保存当前会话。返回 session_id。"""
         if not self.sessions or not self._session_id:
@@ -934,6 +1139,17 @@ class CortexAgent:
                 if self._term:
                     self._term.tool_done(ok, latency, result)
                 self._ctx.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+            # ── Checkpoint: 每 N 步自动保存 ──
+            if (self.config.checkpoint_interval > 0 and
+                step_no % self.config.checkpoint_interval == 0 and
+                self._session_id and self.sessions):
+                self._auto_save()
+            # ── Context compaction: 消息数超阈值时压缩 ──
+            if (self.config.compact_threshold > 0 and
+                len(self._ctx) > self.config.compact_threshold):
+                self._ctx = self.governor.compact(self._ctx, keep_recent=12)
+                if self._term:
+                    self._term._w(f"\n  {self._term.GRAY}[上下文已压缩: {len(self._ctx)}条]{self._term.RESET}\n")
             result = self._reflect(trace, step_no, max_steps)
             if result is not None: return result
             self._last_reasoning = None
@@ -947,6 +1163,8 @@ class CortexAgent:
     def _reflect(self, trace, step_no, max_steps) -> Optional[str]:
         """结构性收敛：仅在达到最大步数时给予一次最终回答机会。"""
         if step_no == max_steps:
+            # 标记步数已耗尽（run_long 依赖此标记决定是否续行）
+            trace.step_limit_reached = True
             final, tcs = self._think()
             if final:
                 trace.final_answer = final
@@ -992,9 +1210,33 @@ class CortexAgent:
             else:
                 return self.llm.call(ctx, thinking=thinking)
 
-        # ── Level 1: 正常推理模式 ──
+        def _is_transient(err: Exception) -> bool:
+            """判断是否为可重试的瞬态错误（429/500/502/503/timeout/connection）。"""
+            msg = str(err).lower()
+            transient_markers = ["429", "500", "502", "503", "timeout", "timed out",
+                                 "connection", "temporar", "overload", "rate limit",
+                                 "service unavailable", "bad gateway", "internal server error"]
+            return any(m in msg for m in transient_markers)
+
+        def _do_call_with_retry(thinking: bool = True, ctx_override: list = None):
+            """带指数退避重试的 LLM 调用。仅在瞬态错误时重试。"""
+            last_err = None
+            for attempt in range(self.config.retry_max + 1):
+                try:
+                    return _do_call(thinking=thinking, ctx_override=ctx_override)
+                except Exception as e:
+                    last_err = e
+                    if not _is_transient(e) or attempt >= self.config.retry_max:
+                        raise
+                    delay = self.config.retry_base_delay * (2 ** attempt)
+                    if term:
+                        term._w(f"\n  {term.YELLOW}[重试 {attempt+1}/{self.config.retry_max}] {delay:.0f}s 后重试: {e}{term.RESET}")
+                    time.sleep(delay)
+            raise last_err  # type: ignore
+
+        # ── Level 1: 正常推理模式（含瞬态错误重试） ──
         try:
-            text, tcs, reasoning, finish_reason = _do_call(thinking=True)
+            text, tcs, reasoning, finish_reason = _do_call_with_retry(thinking=True)
             if reasoning: self._last_reasoning = reasoning
             if text or tcs:
                 return text, tcs

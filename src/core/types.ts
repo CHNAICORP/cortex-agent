@@ -142,6 +142,12 @@ export interface AgentConfig {
   maxResultChars: number;
   // ── Memory 注入控制 ──
   memoryInjectCount: number;
+  // ── 长时运行参数 ──
+  maxRounds: number;
+  checkpointInterval: number;
+  retryMax: number;
+  retryBaseDelay: number;
+  compactThreshold: number;
 }
 
 export function defaultWorkDir(): string {
@@ -154,12 +160,18 @@ export const DEFAULT_CONFIG: AgentConfig = {
   baseUrl: "https://api.deepseek.com/v1",
   model: "deepseek-v4-flash",
   workDir: defaultWorkDir(),
-  maxSteps: 10,
-  toolTimeout: 10,
+  maxSteps: 50,
+  toolTimeout: 30,
   systemPrompt: "",
-  maxContextMsgs: 24,
-  loopTimeout: 120,
-  thinkTimeout: 60,
+  maxContextMsgs: 50,
+  loopTimeout: 600,
+  thinkTimeout: 300,
+  // ── Long-run parameters ──
+  maxRounds: 0,              // 0=unlimited auto-continue
+  checkpointInterval: 5,    // auto-save every N steps
+  retryMax: 3,              // transient error retry count
+  retryBaseDelay: 2.0,      // exponential backoff base delay (seconds)
+  compactThreshold: 60,     // context compaction trigger
   memoryDir: "",
   sessionsDir: "",
   skillsDir: "",

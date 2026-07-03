@@ -28,6 +28,14 @@ const DEFAULT_SYSTEM = [
   "4. 不得读取系统敏感文件。",
   "5. 不得使用编码命令或混淆方式执行 shell。",
   "",
+  "== 项目工程指引 ==",
+  "当任务涉及创建或修改多文件项目时，严格遵循以下工作流：",
+  "1. **先规划再执行**：第一步用 write_file 创建 TASKS.md，列出所有需要完成的里程碑和子任务，每个任务用 [ ] 标记未完成。",
+  "2. **分模块推进**：按依赖顺序逐个模块完成（如：项目骨架→数据层→业务逻辑→API→前端→测试），不要同时开多个模块。",
+  "3. **每步验证**：写完一个文件后，如果是代码文件，立即用 exec_command 运行编译或语法检查（如 tsc --noEmit、python -m py_compile、npm run build）。发现错误立即修复。",
+  "4. **更新进度**：每完成一个子任务，用 edit_file 将 TASKS.md 中对应的 [ ] 改为 [x]。这至关重要——续行时你只能通过 TASKS.md 了解当前进度。",
+  "5. **最后全量测试**：所有模块完成后，运行完整构建和测试命令，确保零错误。",
+  "",
   "你有多种工具可用——文件读写、代码执行、网络搜索、数据库查询等。",
   "每次行动前先思考需要什么信息、哪个工具最合适。",
   "联网搜索或查询实时信息前，先调用 get_current_time 获取当前时间以确保时效性。\n"
@@ -136,6 +144,67 @@ export class ContextGovernor {
     if (this.maxInputTokens <= 0) return 0;
     const est = ContextGovernor.estimateTokens(msgs);
     return Math.min(Math.floor(est / this.maxInputTokens * 100), 100);
+  }
+
+  /** 上下文压缩 — 将旧消息摘要为单条 system 消息，保留最近 N 条。 */
+  compact(msgs: Message[], keepRecent = 10): Message[] {
+    if (msgs.length <= keepRecent + 1) return msgs;
+    const system = msgs[0]?.role === "system" ? msgs[0] : null;
+    const recent = msgs.slice(-keepRecent);
+    const old = system ? msgs.slice(1, -keepRecent) : msgs.slice(0, -keepRecent);
+
+    const summaryParts: string[] = [];
+    const toolCallsSeen: string[] = [];
+    const filesTouched = new Set<string>();
+    for (const m of old) {
+      if (m.role === "user") {
+        const content = (m.content || "").slice(0, 120);
+        if (content.trim()) summaryParts.push(`用户请求: ${content}`);
+      } else if (m.role === "assistant") {
+        if (m.tool_calls) {
+          for (const tc of m.tool_calls) {
+            toolCallsSeen.push(tc.function.name);
+            try {
+              const args = JSON.parse(tc.function.arguments);
+              for (const v of Object.values(args)) {
+                if (typeof v === "string" && (v.includes("/") || v.includes("\\") || /\.(py|ts|js|html|css|json|md)$/.test(v))) {
+                  filesTouched.add(v.slice(0, 80));
+                }
+              }
+            } catch { /* ignore */ }
+          }
+        }
+        const content = (m.content || "").slice(0, 80);
+        if (content.trim()) summaryParts.push(`Agent: ${content}`);
+      } else if (m.role === "tool") {
+        const content = m.content || "";
+        if (content.length > 100) {
+          summaryParts.push(`  → 结果(${content.length}字符): ${content.slice(0, 80)}...`);
+        }
+      }
+    }
+
+    let compactText = `[上下文压缩 — ${old.length}条消息已摘要]\n`;
+    if (toolCallsSeen.length > 0) {
+      const freq: Record<string, number> = {};
+      for (const t of toolCallsSeen) freq[t] = (freq[t] || 0) + 1;
+      const sorted = Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 8);
+      compactText += `工具调用: ${sorted.map(([n, c]) => `${n}×${c}`).join(", ")}\n`;
+    }
+    if (filesTouched.size > 0) {
+      compactText += `涉及文件: ${Array.from(filesTouched).slice(0, 10).join(", ")}\n`;
+    }
+    if (summaryParts.length > 0) {
+      let body = summaryParts.slice(-20).join("\n");
+      if (body.length > 2000) body = body.slice(0, 2000) + "...";
+      compactText += `对话摘要:\n${body}\n`;
+    }
+
+    const result: Message[] = [];
+    if (system) result.push(system);
+    result.push({ role: "system", content: compactText });
+    result.push(...recent);
+    return ContextGovernor._fixToolPairing(result);
   }
 
   static loadKb(projectDir: string): string {
@@ -381,6 +450,9 @@ export class CortexAgent {
 
   constructor(config: Partial<AgentConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+    // Treat 0 as "not set" for timeout fields — fall back to defaults
+    if (!this.config.thinkTimeout) this.config.thinkTimeout = DEFAULT_CONFIG.thinkTimeout;
+    if (!this.config.loopTimeout) this.config.loopTimeout = DEFAULT_CONFIG.loopTimeout;
     let wd = path.resolve(this.config.workDir);
     try {
       fs.mkdirSync(wd, { recursive: true });
@@ -574,13 +646,125 @@ export class CortexAgent {
   }
 
   /**
-   * Auto-extract key facts from the current exchange so they persist
-   * across sessions.  Uses a lightweight heuristic rather than a full LLM
-   * call (the Python side stubs this to a pass).  We capture:
-   *   - Explicit remember_fact calls that went through the executor
-   *   - The query itself as a session bookmark
-   *   - Key search/fetch results as condensed memory entries
+   * 长时运行模式 — 自动续行直到任务完成或达到最大轮数。
+   *
+   * 每轮调用 run() 执行 maxSteps 步。当步数耗尽但任务未完成时：
+   *   1. 保存当前会话（检查点）
+   *   2. 压缩上下文（保留最近上下文 + 进度摘要）
+   *   3. 注入续行提示，自动开始下一轮
+   *
+   * 与 Claude Code 的行为对齐：agent 持续工作直到用户中断或任务完成。
    */
+  async runLong(query: string, maxRounds?: number): Promise<string> {
+    const rounds = maxRounds ?? this.config.maxRounds;
+    const effectiveRounds = rounds === 0 ? 999 : rounds;
+
+    let fullResult = "";
+    for (let roundNo = 1; roundNo <= effectiveRounds; roundNo++) {
+      if (this.term) {
+        const display = effectiveRounds < 999 ? effectiveRounds : "∞";
+        this.term.write(`\n  \x1b[36m═══ 轮次 ${roundNo}/${display} ═══\x1b[0m\n`);
+      }
+
+      // 执行一轮：首轮用 run()，后续轮直接调用 _loop（续行提示已在 ctx 中）
+      let result: string;
+      if (roundNo === 1) {
+        result = await this.run(query, undefined, true);
+      } else {
+        result = await this._loop(this.config.maxSteps) ?? "";
+        this.queryCount++;
+        this.stepCountTotal += this.trace?.steps.length || 0;
+        this._autoSave();
+      }
+
+      // 检查是否完成（trace 没有 stepLimitReached 说明 LLM 自然结束）
+      if (this.trace && !this.trace.stepLimitReached) {
+        fullResult = result;
+        break;
+      }
+
+      // 步数耗尽但未完成 → 检查是否有错误
+      if (this.trace && this.trace.error) {
+        if (this.term) {
+          this.term.write(`\n  \x1b[31m[轮次 ${roundNo} 失败: ${this.trace.error}]\x1b[0m\n`);
+        }
+        fullResult = result;
+        break;
+      }
+
+      // 保存检查点
+      if (this.sessionId && this._sessions) {
+        this._autoSave();
+        if (this.term) {
+          this.term.write(`\n  \x1b[90m[检查点已保存]\x1b[0m\n`);
+        }
+      }
+
+      // 上下文压缩
+      if (this.ctx.length > this.config.compactThreshold) {
+        this.ctx = this.governor.compact(this.ctx, 12);
+        if (this.term) {
+          this.term.write(`  \x1b[90m[上下文已压缩: ${this.ctx.length}条]\x1b[0m\n`);
+        }
+      }
+
+      // 注入进度感知的续行提示
+      this.ctx.push({
+        role: "user",
+        content: this._buildContinuationPrompt(),
+      });
+
+      fullResult = result;
+    }
+
+    return fullResult;
+  }
+
+  // ── TASKS.md 进度追踪 ──
+
+  private get _tasksPath(): string {
+    return path.join(this.config.workDir, "TASKS.md");
+  }
+
+  private _readTasks(): string {
+    try {
+      if (fs.existsSync(this._tasksPath)) {
+        return fs.readFileSync(this._tasksPath, "utf-8");
+      }
+    } catch { /* ignore */ }
+    return "";
+  }
+
+  private static _countTaskProgress(tasksText: string): { done: number; todo: number; total: number; pct: number } {
+    const done = (tasksText.match(/\[x\]/g) || []).length;
+    const todo = (tasksText.match(/\[ \]/g) || []).length;
+    const total = done + todo;
+    const pct = total > 0 ? Math.floor(done / total * 100) : 0;
+    return { done, todo, total, pct };
+  }
+
+  private _buildContinuationPrompt(): string {
+    const tasks = this._readTasks();
+    if (!tasks) {
+      return (
+        "请继续之前的工作。如果任务已完成，请直接给出最终总结。"
+        + "如果还有未完成的步骤，请继续执行。\n"
+        + "提示：如果你还没有创建 TASKS.md 来跟踪进度，请先创建一个。"
+      );
+    }
+    const prog = CortexAgent._countTaskProgress(tasks);
+    let tasksPreview = tasks.slice(0, 2000);
+    if (tasks.length > 2000) tasksPreview += "\n...(TASKS.md 已截断)";
+    return (
+      `请继续之前的工作。当前进度：${prog.done}/${prog.total} 完成（${prog.pct}%）。\n\n`
+      + `== TASKS.md 当前内容 ==\n${tasksPreview}\n\n`
+      + "请根据以上进度：\n"
+      + "- 如果有未完成的 [ ] 任务，继续执行下一个。\n"
+      + "- 如果所有任务都已完成 [x]，请运行最终构建和测试验证，然后给出最终总结。\n"
+      + "- 如果发现已完成的部分有错误，优先修复。"
+    );
+  }
+
   private _autoExtractFacts(_userQuery: string): void {
     if (!this._memory) return;
     const steps = this.trace?.steps || [];
@@ -763,6 +947,21 @@ export class CortexAgent {
         this.ctx.push({ role: "tool", tool_call_id: tc.id, content: result });
       }
 
+      // ── Checkpoint: auto-save every N steps ──
+      if (this.config.checkpointInterval > 0 &&
+        stepNo % this.config.checkpointInterval === 0 &&
+        this.sessionId && this._sessions) {
+        this._autoSave();
+      }
+      // ── Context compaction: compress when messages exceed threshold ──
+      if (this.config.compactThreshold > 0 &&
+        this.ctx.length > this.config.compactThreshold) {
+        this.ctx = this.governor.compact(this.ctx, 12);
+        if (this.term) {
+          this.term.write(`\n  \x1b[90m[上下文已压缩: ${this.ctx.length}条]\x1b[0m\n`);
+        }
+      }
+
       const convergence = await this._reflect(this.trace, stepNo, maxSteps);
       if (convergence !== null) return convergence;
     }
@@ -778,6 +977,8 @@ export class CortexAgent {
 
   private async _reflect(trace: RunTrace, stepNo: number, maxSteps: number): Promise<string | null> {
     if (stepNo === maxSteps) {
+      // 标记步数已耗尽（runLong 依赖此标记决定是否续行）
+      trace.stepLimitReached = true;
       // On the last step, give LLM one more chance to produce a final answer
       const { text, toolCalls } = await this._think();
       if (text) {
@@ -842,9 +1043,35 @@ export class CortexAgent {
       return this.llm.call(ctx, thinking);
     };
 
-    // ── Level 1: 正常推理模式 ──
+    const isTransient = (err: any): boolean => {
+      const msg = String(err?.message || err).toLowerCase();
+      const markers = ["429", "500", "502", "503", "timeout", "timed out",
+        "connection", "temporar", "overload", "rate limit",
+        "service unavailable", "bad gateway", "internal server error"];
+      return markers.some(m => msg.includes(m));
+    };
+
+    const doCallWithRetry = async (thinking: boolean = true, ctxOverride?: Message[]) => {
+      let lastErr: any;
+      for (let attempt = 0; attempt <= this.config.retryMax; attempt++) {
+        try {
+          return await doCall(thinking, ctxOverride);
+        } catch (e: any) {
+          lastErr = e;
+          if (!isTransient(e) || attempt >= this.config.retryMax) throw e;
+          const delay = this.config.retryBaseDelay * Math.pow(2, attempt);
+          if (this.term) {
+            this.term.write(`\n  \x1b[33m[重试 ${attempt + 1}/${this.config.retryMax}] ${delay.toFixed(0)}s 后重试: ${e}\x1b[0m`);
+          }
+          await new Promise(r => setTimeout(r, delay * 1000));
+        }
+      }
+      throw lastErr;
+    };
+
+    // ── Level 1: 正常推理模式（含瞬态错误重试） ──
     try {
-      const { text, toolCalls, reasoning } = await doCall(true);
+      const { text, toolCalls, reasoning } = await doCallWithRetry(true);
       if (text || toolCalls) {
         return { text, toolCalls, reasoning };
       }

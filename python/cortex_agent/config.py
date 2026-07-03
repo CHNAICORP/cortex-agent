@@ -24,10 +24,15 @@ settings.json 结构:
       "models": { "gpt4": "gpt-4o", "gpt4m": "gpt-4o-mini" }
     }
   },
-  "max_steps": 10,
+  "max_steps": 50,
   "work_dir": "./cortex_workspace",
-  "loop_timeout": 120,
-  "think_timeout": 60,
+  "loop_timeout": 600,
+  "think_timeout": 300,
+  "max_rounds": 0,
+  "checkpoint_interval": 5,
+  "retry_max": 3,
+  "retry_base_delay": 2,
+  "compact_threshold": 60,
   "auto_extract_memory": true,
   "memory_enabled": true,
   "sessions_enabled": true
@@ -172,7 +177,9 @@ def apply_to_config(config, settings: dict):
                 "context_limit", "max_tokens", "max_input_tokens",
                 "compress_threshold", "compress_head", "compress_tail",
                 "safety_margin", "input_warn_pct", "input_force_pct",
-                "max_result_chars", "memory_inject_count"):
+                "max_result_chars", "memory_inject_count",
+                "max_rounds", "checkpoint_interval", "retry_max",
+                "retry_base_delay", "compact_threshold"):
         if key in settings:
             setattr(config, key, settings[key])
 
@@ -202,9 +209,14 @@ def create_default_settings(path: str) -> dict:
             "max_results": 5,
             "timeout": 10,
         },
-        "max_steps": 10,
-        "loop_timeout": 120,
-        "think_timeout": 60,
+        "max_steps": 50,
+        "loop_timeout": 600,
+        "think_timeout": 300,
+        "max_rounds": 0,
+        "checkpoint_interval": 5,
+        "retry_max": 3,
+        "retry_base_delay": 2,
+        "compact_threshold": 60,
         "auto_extract_memory": True,
         "memory_enabled": True,
         "sessions_enabled": True,
@@ -248,6 +260,103 @@ def create_default_settings(path: str) -> dict:
         }
     }
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    
+    # 写入纯净的 settings.json（去除注释）
+    clean_default = {k: v for k, v in default.items()}
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(default, f, ensure_ascii=False, indent=2)
+        json.dump(clean_default, f, ensure_ascii=False, indent=2)
+    
+    # 写入带注释的 settings.example.jsonc 作为文档
+    example_path = path.replace(".json", ".example.jsonc")
+    example_content = '''{
+  // ── 模型配置 ──
+  "model": "pro",                            // 使用的模型别名（见 providers.<provider>.models）
+  "provider": "deepseek",                    // 当前激活的提供商
+  "providers": {
+    "deepseek": {
+      "api_key": "",                          // 填入你的 DeepSeek API key
+      "base_url": "https://api.deepseek.com/v1",
+      "models": {
+        "flash": "deepseek-v4-flash",         // 快速模型（适合简单任务）
+        "pro": "deepseek-v4-pro"              // 强力模型（适合复杂任务）
+      }
+    },
+    "glm": {
+      "api_key": "",                          // 填入你的智谱 AI API key
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "models": {}
+    }
+  },
+  "web_search": {
+    "provider": "duckduckgo",                 // duckduckgo | brave | serpapi | tavily
+    "brave_api_key": "",                      // Brave Search API key
+    "serpapi_api_key": "",                    // SerpAPI key
+    "tavily_api_key": "",                     // Tavily API key
+    "max_results": 5,                         // 搜索结果数量
+    "timeout": 10                             // 搜索超时（秒）
+  },
+  
+  // ── Agentic Loop 控制 ──
+  "max_steps": 50,                            // 单轮最大思考-行动步数
+  "max_rounds": 0,                            // 最大轮数（0=无限制，用于 --long 模式）
+  "checkpoint_interval": 5,                  // 每 N 步保存一次断点
+  "retry_max": 3,                             // 工具调用失败重试次数
+  "retry_base_delay": 2,                      // 重试基础延迟（秒）
+  "compact_threshold": 60,                   // 上下文压缩阈值（token 数）
+  "loop_timeout": 600,                        // 单轮超时（秒）
+  "think_timeout": 300,                       // LLM 思考超时（秒）
+  
+  // ── 权限模式 ──
+  "permission_mode": "standard",              // standard | auto | yolo
+  "permission_remember": true,                // 记住用户确认的权限（本次会话）
+  "workspace_only": false,                    // 严格限制工作区外操作
+  
+  // ── 内存/会话 ──
+  "memory_enabled": true,                     // 启用长期记忆
+  "auto_extract_memory": true,                // 自动从对话中提取记忆
+  "sessions_enabled": true,                   // 启用会话管理
+  "memory_inject_count": 30,                  // 注入到上下文的记忆条目数
+  
+  // ── 上下文控制 ──
+  "context_limit": 0,                         // 0=自动计算（安全余量+safety_margin）
+  "max_tokens": 0,                            // 0=使用模型默认值
+  "max_input_tokens": 0,                      // 0=自动计算
+  "compress_threshold": 1500,                 // 消息数量阈值，超过则压缩
+  "compress_head": 600,                       // 压缩时保留的头部消息数
+  "compress_tail": 400,                       // 压缩时保留的尾部消息数
+  "safety_margin": 4096,                      // 输入 Token 安全余量
+  "input_warn_pct": 80,                       // 超过此百分比发出警告
+  "input_force_pct": 90,                      // 超过此百分比强制压缩
+  
+  // ── 工具执行 ──
+  "max_result_chars": 2000,                   // 工具输出最大字符数（超过截断）
+  "tool_timeout": 0,                          // 0=不设置超时
+  
+  // ── MCP 服务器配置 ──
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"],
+      "description": "浏览器自动化（Microsoft 官方）"
+    },
+    "fetch": {
+      "command": "python",
+      "args": ["-m", "mcp_server_fetch"],
+      "description": "HTTP 抓取 + HTML→Markdown"
+    },
+    "sqlite": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sqlite"],
+      "description": "SQLite 数据库查询"
+    },
+    "context7": {
+      "url": "https://mcp.context7.com/mcp",
+      "description": "实时库/框架文档查询"
+    }
+  }
+}
+'''
+    with open(example_path, "w", encoding="utf-8") as f:
+        f.write(example_content)
+    
     return default

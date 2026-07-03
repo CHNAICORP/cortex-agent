@@ -34,6 +34,8 @@ Cortex Agent — Harness Agent 架构 + Agentic Loop 引擎
   ctx --no-stream            关闭流式输出
   ctx --new-session          强制新会话
   ctx --mode yolo            全部放行模式
+  ctx --long "task"         长时运行模式（自动续行直到完成）
+  ctx --max-rounds N        限制续行轮数（0=无限）
   ctx --list-sessions        列出已保存会话
   ctx --resume <SESSION_ID>  恢复到指定会话
   ctx --init-config           创建默认 .cortx/settings.json
@@ -164,7 +166,10 @@ async function main(): Promise<void> {
   const modeIdx = args.indexOf("--mode");
   const permissionMode = (modeIdx >= 0 ? args[modeIdx + 1] : settings.permission_mode || "standard") as "standard" | "auto" | "yolo";
   const maxStepsIdx = args.indexOf("--max-steps");
-  const maxSteps = maxStepsIdx >= 0 ? parseInt(args[maxStepsIdx + 1]) || 10 : (settings.max_steps as number) || 10;
+  const maxSteps = maxStepsIdx >= 0 ? parseInt(args[maxStepsIdx + 1]) || 50 : (settings.max_steps as number) || 50;
+  const longMode = args.includes("--long");
+  const maxRoundsIdx = args.indexOf("--max-rounds");
+  const maxRounds = maxRoundsIdx >= 0 ? parseInt(args[maxRoundsIdx + 1]) || 0 : (settings.max_rounds as number) ?? 0;
   const workDirIdx = args.indexOf("--work-dir");
   const workDir = workDirIdx >= 0 ? args[workDirIdx + 1] : (settings.work_dir as string) || require("../core/types.js").defaultWorkDir() as string;
 
@@ -189,6 +194,13 @@ async function main(): Promise<void> {
     sessionsEnabled: settings.sessions_enabled !== false,
     autoExtractMemory: settings.auto_extract_memory !== false,
     maxSteps,
+    thinkTimeout: (settings.think_timeout as number) || 0,
+    loopTimeout: (settings.loop_timeout as number) || 0,
+    maxRounds,
+    checkpointInterval: (settings.checkpoint_interval as number) || 5,
+    retryMax: (settings.retry_max as number) || 3,
+    retryBaseDelay: (settings.retry_base_delay as number) || 2,
+    compactThreshold: (settings.compact_threshold as number) || 60,
   });
 
   const term = new Terminal();
@@ -227,7 +239,9 @@ async function main(): Promise<void> {
   }
 
   if (query) {
-    const answer = await agent.run(query);
+    const answer = longMode
+      ? await agent.runLong(query)
+      : await agent.run(query);
     if (noStream) console.log(answer);
     const trace = agent.lastTrace;
     if (trace?.steps.length) {
