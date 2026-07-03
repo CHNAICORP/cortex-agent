@@ -339,12 +339,9 @@ export class CortexAgent {
    * call (the Python side stubs this to a pass).  We capture:
    *   - Explicit remember_fact calls that went through the executor
    *   - The query itself as a session bookmark
+   *   - Key search/fetch results as condensed memory entries
    */
   private _autoExtractFacts(_userQuery: string): void {
-    // If the agent already used remember_fact during this turn the
-    // MemoryStore was already updated — nothing extra to do.
-    // Store a lightweight session bookmark so the next resume has *some*
-    // context about what was discussed.
     if (!this.memory) return;
     const steps = this.trace?.steps || [];
     const toolNames = steps.map(s => s.toolName);
@@ -352,6 +349,27 @@ export class CortexAgent {
     if (!toolNames.includes("remember_fact")) {
       const summary = _userQuery.slice(0, 80).replace(/\n/g, " ");
       this.memory.append(`查询: ${summary}`);
+    }
+    // Auto-extract web_search result summaries (URL + title) into memory
+    for (const step of steps) {
+      if (step.toolName === "web_search" && step.success) {
+        // Extract first result line from the search output
+        const result = step.resultPreview;
+        const match = result.match(/\[1\] (.*?)(?:\n|$)/);
+        if (match) {
+          const firstResult = match[1].trim().slice(0, 100);
+          this.memory.append(`搜索到: ${firstResult}`);
+        }
+      }
+      if (step.toolName === "web_fetch" && step.success && step.resultPreview.includes("--- ")) {
+        // Extract page title/URL from fetch result
+        const urlMatch = step.resultPreview.match(/--- (https?:\/\/\S+)/);
+        if (urlMatch) {
+          const url = urlMatch[1];
+          const summary = step.resultPreview.slice(0, 200).replace(/\n/g, " ");
+          this.memory.append(`抓取: ${url}`);
+        }
+      }
     }
   }
 

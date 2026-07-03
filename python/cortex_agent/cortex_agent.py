@@ -603,13 +603,30 @@ class CortexAgent:
     def _auto_extract_facts(self, user_query: str):
         """Auto-extract key facts from each query for cross-session recall.
 
-        Each query summary is appended to memory.md so the next session has
-        context about what was discussed, even if the agent didn't explicitly
-        call remember_fact.
+        Each query summary and key search/fetch results are appended to
+        memory.md so the next session has context about what was discussed,
+        even if the agent didn't explicitly call remember_fact.
         """
-        if self.memory:
+        if not self.memory:
+            return
+        steps = self._trace.steps if self._trace else []
+        tool_names = [s.toolName for s in steps]
+        # Only auto-bookmark if no explicit remember_fact was already called
+        if "remember_fact" not in tool_names:
             summary = user_query[:80].replace("\n", " ").strip()
             self.memory.append(f"查询: {summary}")
+        # Auto-extract web_search result summaries into memory
+        for step in steps:
+            if step.toolName == "web_search" and step.success:
+                result = step.resultPreview
+                m = re.search(r'\[1\]\s*(.*?)(?:\n|$)', result)
+                if m:
+                    first_result = m.group(1).strip()[:100]
+                    self.memory.append(f"搜索到: {first_result}")
+            if step.toolName == "web_fetch" and step.success and "--- " in step.resultPreview:
+                m = re.search(r'---\s*(https?://\S+)', step.resultPreview)
+                if m:
+                    self.memory.append(f"抓取: {m.group(1)}")
 
     @property
     def session_id(self) -> Optional[str]:
