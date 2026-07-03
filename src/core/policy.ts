@@ -10,10 +10,11 @@ import { RiskLevel, Capability, AuditVerdict, PermissionMode } from './types.js'
 import { registry } from './registry.js';
 
 // ── SSRF 拦截网段 ──
+// 注意：127.0.0.0/8 和 ::1/128 已移除 — 允许 localhost 开发访问
 const SSRF_BLOCKED_NETS = [
-  "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
+  "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
   "169.254.0.0/16", "0.0.0.0/8", "224.0.0.0/4",
-  "::1/128", "fc00::/7", "fe80::/10",
+  "fc00::/7", "fe80::/10",
 ];
 
 function ipInCidr(ip: string, cidr: string): boolean {
@@ -72,10 +73,8 @@ export async function checkSsrf(hostOrUrl: string): Promise<[boolean, string]> {
     return [true, ""];
   }
 
-  // Check for localhost variants
-  if (host === "localhost" || host.endsWith(".local") || host.endsWith(".internal")) {
-    return [false, `SSRF 防护: 禁止访问 ${host}`];
-  }
+  // localhost 允许访问（开发场景必需）
+  // 内网 IP 仍由 CIDR 检查拦截
 
   // Hostname — resolve and check all resolved IPs
   try {

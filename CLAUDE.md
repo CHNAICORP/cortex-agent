@@ -133,7 +133,7 @@ meta lookup → content audit (hard block if fails) → permission mode verdict 
 
 ### SSRF protection
 
-10 CIDR ranges blocked in both implementations: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `169.254.0.0/16`, `0.0.0.0/8`, `224.0.0.0/4`, `::1/128`, `fc00::/7`, `fe80::/10`. Python uses `ipaddress` module; TS uses manual CIDR bit math.
+8 CIDR ranges blocked in both implementations: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `0.0.0.0/8`, `224.0.0.0/4`, `fc00::/7`, `fe80::/10`. `127.0.0.0/8` and `::1/128` are **allowed** (localhost development access). Python uses `ipaddress` module; TS uses manual CIDR bit math.
 
 ### Adaptive guard
 

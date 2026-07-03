@@ -35,36 +35,92 @@ def _resolve_command(cmd: list) -> list:
     return cmd
 
 
-def _mcp_exchange(server_cmd: list, requests: list, timeout: float = 15.0) -> list:
+def _mcp_exchange(server_cmd: list, requests: list, timeout: float = 30.0) -> list:
     """启动 MCP 服务器，发送请求序列，返回解析后的 JSON 响应列表。
     
-    协议：先写全部请求 → 关闭 stdin → communicate() 读取全部响应。
-    这样避免了 stdio 管道上的死锁。
+    改进实现：逐行读取 stdout，用 queue 实现真正的超时控制。
+    使用线程读取 stderr 防止管道死锁。
     """
-    import subprocess as _sp, json as _j
+    import subprocess as _sp, json as _j, threading as _th, queue as _q, time as _t
+    
     proc = _sp.Popen(server_cmd, stdin=_sp.PIPE, stdout=_sp.PIPE,
-                     stderr=_sp.PIPE, text=True)
-    # 写入所有请求（含换行）
-    for req in requests:
-        proc.stdin.write(req + "\n")
-    proc.stdin.flush()
-    proc.stdin.close()
-    # 读取全部响应
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except _sp.TimeoutExpired:
-        proc.kill()
-        stdout, stderr = proc.communicate()
-    # 解析 JSON 行
+                     stderr=_sp.PIPE, text=True, bufsize=1, encoding='utf-8',
+                     errors='replace')
+    
     responses = []
-    for line in stdout.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
+    line_queue: _q.Queue = _q.Queue()
+    
+    def _read_stdout():
+        """逐行读取 stdout，放入队列。"""
         try:
-            responses.append(_j.loads(line))
-        except _j.JSONDecodeError:
+            for line in proc.stdout:
+                line_queue.put(line)
+        except Exception:
             pass
+        finally:
+            line_queue.put(None)  # EOF 标记
+    
+    def _read_stderr():
+        try:
+            for _ in proc.stderr:
+                pass
+        except Exception:
+            pass
+    
+    stdout_thread = _th.Thread(target=_read_stdout, daemon=True)
+    stdout_thread.start()
+    stderr_thread = _th.Thread(target=_read_stderr, daemon=True)
+    stderr_thread.start()
+    
+    try:
+        for req in requests:
+            proc.stdin.write(req + "\n")
+            proc.stdin.flush()
+            # 如果是通知（没有 id），不等待响应
+            try:
+                parsed = _j.loads(req)
+                if "id" not in parsed:
+                    continue
+            except _j.JSONDecodeError:
+                continue
+            # 等待带 id 的响应（真正的超时控制）
+            deadline = _t.time() + timeout
+            got_response = False
+            while _t.time() < deadline and not got_response:
+                remaining = deadline - _t.time()
+                try:
+                    line = line_queue.get(timeout=min(remaining, 5.0))
+                except _q.Empty:
+                    continue
+                if line is None:
+                    break  # EOF
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    resp = _j.loads(line)
+                    responses.append(resp)
+                    got_response = True
+                except _j.JSONDecodeError:
+                    continue
+            if not got_response:
+                break  # 超时或 EOF
+    except BrokenPipeError:
+        pass
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    
     return responses
 
 

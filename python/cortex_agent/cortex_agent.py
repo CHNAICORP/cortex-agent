@@ -81,11 +81,12 @@ class RunTrace:
 
 _SSRF_BLOCKED_NETS = [
     ipaddress.ip_network("10.0.0.0/8"), ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"), ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("192.168.0.0/16"),
     ipaddress.ip_network("169.254.0.0/16"), ipaddress.ip_network("0.0.0.0/8"),
-    ipaddress.ip_network("224.0.0.0/4"), ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("224.0.0.0/4"),
     ipaddress.ip_network("fc00::/7"), ipaddress.ip_network("fe80::/10"),
 ]
+# 注意：127.0.0.0/8 和 ::1/128 已移除 — 允许 localhost 开发访问
 
 def check_ssrf(host_or_url: str) -> Tuple[bool, str]:
     """Reusable SSRF check. Resolves host to IP, checks against blocked nets.

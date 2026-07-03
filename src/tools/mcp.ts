@@ -35,58 +35,38 @@ export const MCP_REGISTRY: Record<string, McpRegistryEntry> = {
   "sequential-thinking": { name: "Sequential Thinking MCP", desc: "多步推理与思维链增强", category: "reasoning", install: ["npx", "-y", "@modelcontextprotocol/server-sequential-thinking"], requires: "node" },
 };
 
-// ── MCP JSON-RPC exchange ──
-export function mcpExchange(serverCmd: string[], requests: string[], timeout = 15000): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(serverCmd[0], serverCmd.slice(1), {
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout,
-    });
-    const stdoutChunks: string[] = [];
-    const stderrChunks: string[] = [];
-    let resolved = false;
-
-    proc.stdout.on("data", (data: Buffer) => {
-      stdoutChunks.push(data.toString());
-    });
-    proc.stderr.on("data", (data: Buffer) => {
-      stderrChunks.push(data.toString());
-    });
-
-    // Write all requests then close stdin
-    for (const req of requests) {
-      proc.stdin.write(req + "\n");
+// ── Windows command resolution ──
+function resolveCommand(cmd: string[]): string[] {
+  if (process.platform === "win32") {
+    // On Windows, npx/npm are .cmd files — spawn needs shell:true or full path
+    const which = require("child_process").spawnSync("where", [cmd[0]], { encoding: "utf-8" });
+    if (which.status === 0 && which.stdout.trim()) {
+      cmd[0] = which.stdout.trim().split(/\r?\n/)[0];
     }
-    proc.stdin.end();
+  }
+  return cmd;
+}
+
+// ── MCP JSON-RPC exchange ──
+export function mcpExchange(serverCmd: string[], requests: string[], timeout = 30000): Promise<any[]> {
+  return new Promise((resolve, reject) => {
+    const resolvedCmd = resolveCommand([...serverCmd]);
+    const proc = spawn(resolvedCmd[0], resolvedCmd.slice(1), {
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: process.platform === "win32",  // Windows 需要 shell 模式来解析 .cmd 文件
+    });
+    const responses: any[] = [];
+    const lineBuffer: string[] = [];
+    let resolved = false;
+    let currentRequestIdx = 0;
 
     const timer = setTimeout(() => {
       if (!resolved) {
-        proc.kill();
         resolved = true;
-        // Parse whatever we got
-        const responses: any[] = [];
-        for (const line of stdoutChunks.join("").split("\n")) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          try { responses.push(JSON.parse(trimmed)); } catch { /* skip non-JSON */ }
-        }
+        proc.kill();
         resolve(responses);
       }
     }, timeout);
-
-    proc.on("close", () => {
-      if (!resolved) {
-        resolved = true;
-        clearTimeout(timer);
-        const responses: any[] = [];
-        for (const line of stdoutChunks.join("").split("\n")) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          try { responses.push(JSON.parse(trimmed)); } catch { /* skip non-JSON */ }
-        }
-        resolve(responses);
-      }
-    });
 
     proc.on("error", (err) => {
       if (!resolved) {
@@ -95,6 +75,71 @@ export function mcpExchange(serverCmd: string[], requests: string[], timeout = 1
         reject(err);
       }
     });
+
+    proc.on("close", () => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        resolve(responses);
+      }
+    });
+
+    // 逐行读取 stdout
+    proc.stdout.on("data", (data: Buffer) => {
+      const text = data.toString();
+      for (const ch of text) {
+        if (ch === "\n") {
+          const line = lineBuffer.join("").trim();
+          lineBuffer.length = 0;
+          if (!line) continue;
+          try {
+            const resp = JSON.parse(line);
+            responses.push(resp);
+            // 收到响应后发送下一个请求
+            sendNextRequest();
+          } catch { /* skip non-JSON */ }
+        } else {
+          lineBuffer.push(ch);
+        }
+      }
+    });
+
+    proc.stderr.on("data", () => { /* 吞掉 stderr 防止死锁 */ });
+
+    function sendNextRequest() {
+      currentRequestIdx++;
+      while (currentRequestIdx < requests.length) {
+        const req = requests[currentRequestIdx];
+        proc.stdin.write(req + "\n");
+        try {
+          const parsed = JSON.parse(req);
+          if ("id" in parsed) {
+            // 有 id 的请求，等待响应
+            return;
+          }
+          // 通知（无 id），继续发送下一个
+          currentRequestIdx++;
+        } catch {
+          currentRequestIdx++;
+        }
+      }
+      // 所有请求已发送，关闭 stdin
+      try { proc.stdin.end(); } catch { /* already closed */ }
+    }
+
+    // 发送第一个请求
+    if (requests.length > 0) {
+      proc.stdin.write(requests[0] + "\n");
+      try {
+        const parsed = JSON.parse(requests[0]);
+        if (!("id" in parsed)) {
+          // 第一个是通知，继续发送
+          sendNextRequest();
+        }
+      } catch { /* skip */ }
+    } else {
+      try { proc.stdin.end(); } catch { /* */ }
+    }
   });
 }
 
