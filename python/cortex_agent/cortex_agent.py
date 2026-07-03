@@ -361,6 +361,7 @@ class AgentConfig:
     permission_remember: bool = True    # 记住用户在会话中的决策
     workspace_only: bool = False        # True=回退到旧沙箱模式
     context_limit: int = 1_000_000     # DeepSeek V4 上下文窗口 (1M tokens)
+    max_tokens: int = 8192             # LLM 输出 token 上限（reasoning + content 共享）
 
 
 # ══════════════════════════════════════════════════════════════
@@ -411,7 +412,8 @@ class CortexAgent:
         self._suspended_capabilities: Set[Capability] = set()
         self.llm = LLMProvider(self.config.api_key,
                                LLMProvider.resolve(self.config.model), registry.schemas,
-                               timeout=self.config.think_timeout)
+                               timeout=self.config.think_timeout,
+                               max_tokens=self.config.max_tokens)
         self._ctx: List[Dict] = []; self._trace = None
         self._last_reasoning: str = None
         self._term: Optional['Terminal'] = None  # 终端显示回调
@@ -644,7 +646,11 @@ class CortexAgent:
             self._ctx = self.governor.govern(self._ctx)
             content, tool_calls = self._think()
             if content is None and not tool_calls:
-                trace.error = "LLM 调用失败"; return trace.error
+                trace.error = "LLM 调用失败（空响应，已重试3次+注入提示）"
+                if self._term:
+                    self._term._w(f"\n{trace.error}\n")
+                    return ""
+                return trace.error
             if not tool_calls:
                 # push assistant reply into ctx so multi-turn remembers it
                 self._ctx.append({"role": "assistant", "content": content})
@@ -734,25 +740,90 @@ class CortexAgent:
         return None
 
     def _think(self) -> Tuple[Optional[str], Optional[List[Dict]]]:
+        """Think 阶段 — 调用 LLM，带空响应自适应恢复。
+
+        恢复策略（按根因分层）:
+          1. finish_reason="length" → 推理吃光了 max_tokens 预算
+             → 关闭 thinking 重试，将全部预算留给 content/tool_calls
+          2. finish_reason="stop" 但空内容 → LLM 真正返回了空
+             → 注入 nudge 消息强制生成回答
+          3. API 异常 → 常规重试
+        """
         term = self._term
+
+        def _do_call(thinking: bool = True):
+            """封装 LLM 调用，返回 (text, tcs, reasoning, finish_reason)。"""
+            if term:
+                return self.llm.call_stream(
+                    self._ctx,
+                    on_text=term.think_token,
+                    on_answer=term.answer_token,
+                    on_tool=self._tool_labeled(),
+                    thinking=thinking)
+            else:
+                return self.llm.call(self._ctx, thinking=thinking)
+
         for attempt in range(3):
             try:
-                if term:
-                    # terminal streaming path: deep reasoning + bright answer
-                    text, tcs, reasoning = self.llm.call_stream(
-                        self._ctx,
-                        on_text=term.think_token,
-                        on_answer=term.answer_token,
-                        on_tool=self._tool_labeled())
-                    if reasoning: self._last_reasoning = reasoning
+                text, tcs, reasoning, finish_reason = _do_call(thinking=True)
+                if reasoning: self._last_reasoning = reasoning
+
+                # ── 正常响应 ──
+                if text or tcs:
                     return text, tcs
-                else:
-                    text, tcs, reasoning = self.llm.call(self._ctx)
-                    if reasoning: self._last_reasoning = reasoning
-                    return text, tcs
+
+                # ── 空响应: 根据 finish_reason 分层恢复 ──
+                if finish_reason == "length":
+                    # 推理吃光了 max_tokens → 关闭 thinking 重试
+                    # 全部 8192 token 预算留给 content/tool_calls
+                    if attempt < 2:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    # 最终尝试: 关闭 thinking + 注入 nudge
+                    nudge = {"role": "user",
+                             "content": "请根据以上工具返回的信息，直接给出你的回答。"}
+                    self._ctx.append(nudge)
+                    try:
+                        text, tcs, reasoning, _ = _do_call(thinking=False)
+                        if reasoning: self._last_reasoning = reasoning
+                    except Exception:
+                        pass
+                    finally:
+                        if self._ctx and self._ctx[-1] is nudge:
+                            self._ctx.pop()
+                    if text or tcs:
+                        return text, tcs
+                    return None, None
+
+                elif finish_reason == "stop" or not finish_reason:
+                    # LLM 真正返回了空内容 → 注入 nudge
+                    if attempt < 2:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    nudge = {"role": "user",
+                             "content": "请根据以上工具返回的信息，直接给出你的回答。"}
+                    self._ctx.append(nudge)
+                    try:
+                        text, tcs, reasoning, _ = _do_call(thinking=False)
+                        if reasoning: self._last_reasoning = reasoning
+                    except Exception:
+                        pass
+                    finally:
+                        if self._ctx and self._ctx[-1] is nudge:
+                            self._ctx.pop()
+                    if text or tcs:
+                        return text, tcs
+                    return None, None
+
+                # 未知 finish_reason → 常规重试
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                return None, None
+
             except Exception as e:
                 if attempt < 2: time.sleep(0.5 * (attempt + 1))
-        return None, None  # 失败返回 None，让 _loop 正确处理
+        return None, None
 
     def _tool_labeled(self):
         """on_tool 回调 — 哨兵 name=\"\" 时关闭推理颜色"""

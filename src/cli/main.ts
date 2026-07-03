@@ -80,7 +80,7 @@ async function main(): Promise<void> {
       model: "pro", provider: "deepseek",
       providers: { deepseek: { api_key: "", base_url: "https://api.deepseek.com/v1", models: { flash: "deepseek-v4-flash", pro: "deepseek-v4-pro" } } },
       web_search: { provider: "duckduckgo", brave_api_key: "", serpapi_api_key: "", tavily_api_key: "", max_results: 5, timeout: 10 },
-      max_steps: 10, context_limit: 1000000, permission_mode: "standard",
+      max_steps: 10, context_limit: 1000000, max_tokens: 8192, permission_mode: "standard",
       auto_extract_memory: true, memory_enabled: true, sessions_enabled: true,
     };
     fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
@@ -129,7 +129,7 @@ async function main(): Promise<void> {
     const newSettings = {
       model: modelAlias, provider: prov,
       providers: { [prov]: { api_key: apiKey, base_url: `https://api.${prov}.com/v1`, models: { [modelAlias]: modelName } } },
-      max_steps: 10, context_limit: 1000000, permission_mode: "standard",
+      max_steps: 10, context_limit: 1000000, max_tokens: 8192, permission_mode: "standard",
       auto_extract_memory: true, memory_enabled: true, sessions_enabled: true,
     };
     fs.mkdirSync(path.dirname(userPath), { recursive: true });
@@ -158,6 +158,7 @@ async function main(): Promise<void> {
     workDir,
     permissionMode,
     contextLimit: (settings.context_limit as number) || 1_000_000,
+    maxTokens: (settings.max_tokens as number) || 8192,
     memoryEnabled: settings.memory_enabled !== false,
     sessionsEnabled: settings.sessions_enabled !== false,
     autoExtractMemory: settings.auto_extract_memory !== false,

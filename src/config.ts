@@ -75,7 +75,7 @@ export function loadSettings(): Settings {
         max_results: 5,
         timeout: 10,
       },
-      max_steps: 10, context_limit: 1000000, permission_mode: "standard",
+      max_steps: 10, context_limit: 1000000, max_tokens: 8192, permission_mode: "standard",
       auto_extract_memory: true, memory_enabled: true, sessions_enabled: true,
     };
     fs.mkdirSync(path.dirname(user), { recursive: true });

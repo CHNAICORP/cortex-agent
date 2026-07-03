@@ -92,7 +92,7 @@ def setup_wizard(config: 'AgentConfig', settings: dict) -> 'AgentConfig':
         "provider": provider,
         "providers": {provider: {"api_key": api_key, "base_url": f"https://api.{provider}.com/v1",
                                   "models": {model_alias: model_name}}},
-        "max_steps": 10, "context_limit": 1000000, "permission_mode": "standard",
+        "max_steps": 10, "context_limit": 1000000, "max_tokens": 8192, "permission_mode": "standard",
         "auto_extract_memory": True, "memory_enabled": True, "sessions_enabled": True,
     }
     os.makedirs(os.path.dirname(user_path), exist_ok=True)

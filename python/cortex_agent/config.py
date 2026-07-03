@@ -98,6 +98,7 @@ def load_settings(project_dir: str = None) -> dict:
             },
             "max_steps": 10,
             "context_limit": 1000000,
+            "max_tokens": 8192,
             "permission_mode": "standard",
             "auto_extract_memory": True,
             "memory_enabled": True,
@@ -145,7 +146,7 @@ def apply_to_config(config, settings: dict):
                 "work_dir", "memory_dir", "sessions_dir", "skills_dir",
                 "memory_enabled", "sessions_enabled", "auto_extract_memory",
                 "permission_mode", "permission_remember", "workspace_only",
-                "context_limit"):
+                "context_limit", "max_tokens"):
         if key in settings:
             setattr(config, key, settings[key])
 
@@ -180,6 +181,7 @@ def create_default_settings(path: str) -> dict:
         "permission_remember": True,
         "workspace_only": False,
         "context_limit": 1000000,
+        "max_tokens": 8192,
         "mcpServers": {
             "playwright": {
                 "command": "npx",

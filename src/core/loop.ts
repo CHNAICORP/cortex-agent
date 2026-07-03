@@ -247,6 +247,7 @@ export class CortexAgent {
       model: LLMProvider.resolve(this.config.model),
       tools: registry.schemaList,
       timeout: this.config.thinkTimeout,
+      maxTokens: this.config.maxTokens,
     });
     this._makeGovernor();
   }
@@ -497,7 +498,12 @@ export class CortexAgent {
       this.ctx = this.governor.govern(this.ctx);
       const { text, toolCalls, reasoning } = await this._think();
       if (text === null && !toolCalls) {
-        this.trace.error = "LLM 调用失败";
+        this.trace.error = "LLM 调用失败（空响应，已重试3次+注入提示）";
+        if (this.term) {
+          this.term.closeThinking();
+          this.term.write(`\n${this.trace.error}\n`);
+          return "";
+        }
         return this.trace.error;
       }
       if (!toolCalls) {
@@ -613,15 +619,74 @@ export class CortexAgent {
   private async _think(): Promise<{
     text: string | null; toolCalls: ParsedToolCall[] | null; reasoning: string;
   }> {
+    /**
+     * Think 阶段 — 调用 LLM，带空响应自适应恢复。
+     *
+     * 恢复策略（按根因分层）:
+     *   1. finishReason="length" → 推理吃光了 max_tokens 预算
+     *      → 关闭 thinking 重试，将全部预算留给 content/tool_calls
+     *   2. finishReason="stop" 但空内容 → LLM 真正返回了空
+     *      → 注入 nudge 消息强制生成回答
+     *   3. API 异常 → 常规重试
+     */
+
+    const doCall = async (thinking: boolean = true) => {
+      if (this.term) {
+        return this.llm.callStream(this.ctx,
+          t => this.term!.thinkToken(t),
+          t => this.term!.answerToken(t),
+          thinking,
+        );
+      }
+      return this.llm.call(this.ctx, thinking);
+    };
+
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        if (this.term) {
-          return await this.llm.callStream(this.ctx,
-            t => this.term!.thinkToken(t),
-            t => this.term!.answerToken(t),
-          );
+        const { text, toolCalls, reasoning, finishReason } = await doCall(true);
+
+        // ── 正常响应 ──
+        if (text || toolCalls) {
+          return { text, toolCalls, reasoning };
         }
-        return await this.llm.call(this.ctx);
+
+        // ── 空响应: 根据 finishReason 分层恢复 ──
+        if (finishReason === "length") {
+          // 推理吃光了 max_tokens → 关闭 thinking 重试
+          if (attempt < 2) {
+            await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+            continue;
+          }
+          // 最终尝试: 关闭 thinking + 注入 nudge
+          const nudge: Message = { role: "user", content: "请根据以上工具返回的信息，直接给出你的回答。" };
+          this.ctx.push(nudge);
+          try {
+            const r2 = await doCall(false);
+            if (r2.text || r2.toolCalls) {
+              this.ctx.pop();
+              return { text: r2.text, toolCalls: r2.toolCalls, reasoning: r2.reasoning };
+            }
+          } catch { /* ignore */ }
+          this.ctx.pop();
+          return { text: null, toolCalls: null, reasoning: "" };
+        }
+
+        // finishReason="stop" 或空 → LLM 真正返回了空内容 → 注入 nudge
+        if (attempt < 2) {
+          await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+          continue;
+        }
+        const nudge: Message = { role: "user", content: "请根据以上工具返回的信息，直接给出你的回答。" };
+        this.ctx.push(nudge);
+        try {
+          const r2 = await doCall(false);
+          if (r2.text || r2.toolCalls) {
+            this.ctx.pop();
+            return { text: r2.text, toolCalls: r2.toolCalls, reasoning: r2.reasoning };
+          }
+        } catch { /* ignore */ }
+        this.ctx.pop();
+        return { text: null, toolCalls: null, reasoning: "" };
       } catch (e) {
         if (attempt < 2) await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
       }

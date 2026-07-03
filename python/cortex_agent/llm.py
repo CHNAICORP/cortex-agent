@@ -74,10 +74,11 @@ class LLMProvider:
         return cls._provider_name or "deepseek"
 
     def __init__(self, api_key: str, model: str, tools: List[Dict],
-                 timeout: float = 60.0):
+                 timeout: float = 60.0, max_tokens: int = 8192):
         self.client = OpenAI(api_key=api_key, base_url=self.base_url(),
                              timeout=httpx.Timeout(timeout, connect=10.0))
         self.model = model; self.tools = tools
+        self.max_tokens = max_tokens
         # ── 缓存命中率追踪 ──
         self._call_count: int = 0
         self._cache_hits: int = 0
@@ -114,37 +115,63 @@ class LLMProvider:
 
     def switch(self, alias: str): self.model = self.resolve(alias)
 
-    def call(self, messages: List[Dict]) -> Tuple[str, Optional[List[Dict]], Optional[str]]:
-        resp = self.client.chat.completions.create(
-            model=self.model, messages=messages, tools=self.tools,
-            extra_body={"thinking": {"type": "enabled"}}, reasoning_effort="max")
+    def call(self, messages: List[Dict], thinking: bool = True
+             ) -> Tuple[str, Optional[List[Dict]], Optional[str], str]:
+        """非流式调用。返回 (text, tool_calls, reasoning, finish_reason)。
+        
+        thinking=False 时关闭推理模式，用于空响应恢复——确保 LLM 将全部
+        max_tokens 预算用于 content/tool_calls 而非 reasoning。
+        """
+        kwargs: Dict = {
+            "model": self.model, "messages": messages,
+            "tools": self.tools, "max_tokens": self.max_tokens,
+        }
+        if thinking:
+            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+            kwargs["reasoning_effort"] = "max"
+        resp = self.client.chat.completions.create(**kwargs)
         self._track_usage(resp)
-        msg = resp.choices[0].message
+        choice = resp.choices[0]
+        msg = choice.message
         text = msg.content or ""
         reasoning = getattr(msg, 'reasoning_content', None) or None
+        finish_reason = choice.finish_reason or ""
         tcs = None
         if msg.tool_calls:
             tcs = [{"id": tc.id, "name": tc.function.name,
                     "args": json.loads(tc.function.arguments) if tc.function.arguments else {}}
                    for tc in msg.tool_calls]
-        return text, tcs, reasoning
+        return text, tcs, reasoning, finish_reason
 
     def call_stream(self, messages: List[Dict],
                     on_text: Callable[[str], None] = None,
                     on_answer: Callable[[str], None] = None,
-                    on_tool: Callable[[str, dict], None] = None
-                    ) -> Tuple[str, Optional[List[Dict]], str]:
-        """流式调用：返回 (text, tool_calls, reasoning_text)"""
-        resp = self.client.chat.completions.create(
-            model=self.model, messages=messages, tools=self.tools,
-            extra_body={"thinking": {"type": "enabled"}}, reasoning_effort="max",
-            stream=True)
+                    on_tool: Callable[[str, dict], None] = None,
+                    thinking: bool = True
+                    ) -> Tuple[str, Optional[List[Dict]], str, str]:
+        """流式调用：返回 (text, tool_calls, reasoning_text, finish_reason)。
+        
+        thinking=False 时关闭推理模式，用于空响应恢复。
+        """
+        kwargs: Dict = {
+            "model": self.model, "messages": messages,
+            "tools": self.tools, "max_tokens": self.max_tokens,
+            "stream": True,
+        }
+        if thinking:
+            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+            kwargs["reasoning_effort"] = "max"
+        resp = self.client.chat.completions.create(**kwargs)
         reasoning_parts, text_parts = [], []
         tool_buf: Dict[int, dict] = {}
         reasoning_done = False
         tool_seen = False
+        finish_reason = ""
         for chunk in resp:
-            delta = chunk.choices[0].delta if chunk.choices else None
+            choice = chunk.choices[0] if chunk.choices else None
+            if choice and choice.finish_reason:
+                finish_reason = choice.finish_reason
+            delta = choice.delta if choice else None
             if not delta: continue
             if getattr(delta, 'reasoning_content', None):
                 reasoning_parts.append(delta.reasoning_content)
@@ -180,5 +207,5 @@ class LLMProvider:
         self._call_count += 1
         total_chars = sum(len(m.get("content", "") or "") for m in messages)
         self._total_input_tokens += int(total_chars * 0.4)
-        return text, tcs, reasoning
+        return text, tcs, reasoning, finish_reason
 

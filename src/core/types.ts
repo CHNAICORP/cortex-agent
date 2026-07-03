@@ -129,6 +129,7 @@ export interface AgentConfig {
   permissionRemember: boolean;
   workspaceOnly: boolean;
   contextLimit: number;
+  maxTokens: number;
 }
 
 export function defaultWorkDir(): string {
@@ -157,4 +158,5 @@ export const DEFAULT_CONFIG: AgentConfig = {
   permissionRemember: true,
   workspaceOnly: false,
   contextLimit: 1_000_000,
+  maxTokens: 8192,
 };

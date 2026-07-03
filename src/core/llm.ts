@@ -10,6 +10,7 @@ interface LLMConfig {
   model: string;
   tools: FunctionSchema[];
   timeout: number;
+  maxTokens: number;
 }
 
 interface ParsedToolCall {
@@ -24,6 +25,7 @@ interface LLMResponse {
   text: string;
   toolCalls: ParsedToolCall[] | null;
   reasoning: string;
+  finishReason: string;
 }
 
 const DEFAULT_PROVIDERS: Record<string, { baseUrl: string; models: Record<string, string> }> = {
@@ -63,6 +65,7 @@ export class LLMProvider {
   model: string;
   private tools: FunctionSchema[];
   private timeout: number;
+  private maxTokens: number;
 
   // 缓存统计
   private callCount = 0;
@@ -76,6 +79,7 @@ export class LLMProvider {
     this.model = config.model;
     this.tools = config.tools;
     this.timeout = config.timeout;
+    this.maxTokens = config.maxTokens;
   }
 
   get cacheStats(): CacheStats {
@@ -88,13 +92,17 @@ export class LLMProvider {
     };
   }
 
-  async call(messages: Message[]): Promise<LLMResponse> {
+  async call(messages: Message[], thinking = true): Promise<LLMResponse> {
     const body: Record<string, unknown> = {
       model: this.model,
       messages,
       tools: this.tools.length > 0 ? this.tools : undefined,
-      extra_body: { thinking: { type: "enabled" } },
+      max_tokens: this.maxTokens,
     };
+    if (thinking) {
+      body.extra_body = { thinking: { type: "enabled" } };
+      body.reasoning_effort = "max";
+    }
 
     const resp = await fetch(`${this.baseUrl}/chat/completions`, {
       method: "POST",
@@ -117,9 +125,11 @@ export class LLMProvider {
       if (cached > 0) this.cacheHits++;
     }
 
-    const msg = (data.choices as Array<{ message?: Record<string, unknown> }>)?.[0]?.message;
+    const choice = (data.choices as Array<{ message?: Record<string, unknown>; finish_reason?: string }>)?.[0];
+    const msg = choice?.message;
     const text: string = (msg?.content as string) || "";
     const reasoning: string = (msg?.reasoning_content as string) || "";
+    const finishReason: string = choice?.finish_reason || "";
 
     let toolCalls: ParsedToolCall[] | null = null;
     if (msg?.tool_calls) {
@@ -130,21 +140,26 @@ export class LLMProvider {
       }));
     }
 
-    return { text, toolCalls, reasoning };
+    return { text, toolCalls, reasoning, finishReason };
   }
 
   async callStream(
     messages: Message[],
     onText?: (t: string) => void,
     onAnswer?: (t: string) => void,
+    thinking = true,
   ): Promise<LLMResponse> {
     const body: Record<string, unknown> = {
       model: this.model,
       messages,
       tools: this.tools.length > 0 ? this.tools : undefined,
-      extra_body: { thinking: { type: "enabled" } },
+      max_tokens: this.maxTokens,
       stream: true,
     };
+    if (thinking) {
+      body.extra_body = { thinking: { type: "enabled" } };
+      body.reasoning_effort = "max";
+    }
 
     const resp = await fetch(`${this.baseUrl}/chat/completions`, {
       method: "POST",
@@ -162,8 +177,9 @@ export class LLMProvider {
     const reasoningParts: string[] = [];
     const toolBuf: Map<number, { id: string; name: string; argsJson: string }> = new Map();
     let reasoningDone = false;
+    let finishReason = "";
 
-    if (!reader) return { text: "", toolCalls: null, reasoning: "" };
+    if (!reader) return { text: "", toolCalls: null, reasoning: "", finishReason };
 
     while (true) {
       const { done, value } = await reader.read();
@@ -175,7 +191,9 @@ export class LLMProvider {
         if (data === "[DONE]") continue;
         try {
           const parsed = JSON.parse(data);
-          const delta = parsed.choices?.[0]?.delta;
+          const choice = parsed.choices?.[0];
+          if (choice?.finish_reason) finishReason = choice.finish_reason;
+          const delta = choice?.delta;
           if (!delta) continue;
           if (delta.reasoning_content) {
             reasoningParts.push(delta.reasoning_content);
@@ -217,7 +235,7 @@ export class LLMProvider {
         });
       }
     }
-    return { text, toolCalls, reasoning };
+    return { text, toolCalls, reasoning, finishReason };
   }
 
   switch(alias: string): void {
