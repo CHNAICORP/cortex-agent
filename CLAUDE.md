@@ -31,11 +31,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 3. Build & Test both locally:
    npx tsc --outDir dist          # TypeScript — must compile with 0 errors
    python -c "import sys;sys.path.insert(0,'python');import cortex_agent.tools"  # Python — must import clean
-4. Run agent end-to-end tests (use --mode auto-edit):
+4. Run agent end-to-end tests (use --mode auto):
    # Python
    python -c "import sys;sys.path.insert(0,'python');from cortex_agent.main import main;..." -q "test query"
    # TypeScript (requires proxy if behind firewall)
-   ctx --no-stream --mode auto-edit -q "test query"
+   ctx --no-stream --mode auto -q "test query"
 5. When both pass → version bump → git commit + tag → publish
 ```
 
@@ -116,10 +116,10 @@ All HTTP calls use a proxy-aware opener (`_build_opener()` in Python, `httpReque
 | Mode | SAFE tools | WRITE tools | SYSTEM tools |
 |------|-----------|-------------|--------------|
 | `standard` | auto-allow | within-workspace auto-allow, outside confirm | confirm |
-| `auto-edit` | auto-allow | auto-allow (even outside) | auto-allow |
+| `auto` | auto-allow | auto-allow (even outside) | auto-allow |
 | `yolo` | auto-allow | auto-allow | auto-allow |
 
-CONFIRM verdicts in non-interactive (`--no-stream`) standard mode auto-deny. In yolo/auto-edit, they auto-allow. `_request_confirmation()` in Python prompts `[Y/n/always/deny]` interactively.
+CONFIRM verdicts in non-interactive (`--no-stream`) standard mode auto-deny. In yolo/auto, they auto-allow. `_request_confirmation()` in Python prompts `[Y/n/always/deny]` interactively.
 
 ### PolicyEngine: always-content-audit
 

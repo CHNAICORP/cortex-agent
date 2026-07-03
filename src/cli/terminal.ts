@@ -74,8 +74,8 @@ export class Terminal {
   }
 
   banner(model: string, tools: number, workDir: string, mode: string, sessionId?: string) {
-    const modeColors: Record<string, string> = { standard: Terminal.GREEN, "auto-edit": Terminal.YELLOW, yolo: Terminal.RED };
-    const modeIcons: Record<string, string> = { standard: "🛡️", "auto-edit": "✏️", yolo: "⚠️" };
+    const modeColors: Record<string, string> = { standard: Terminal.GREEN, auto: Terminal.YELLOW, yolo: Terminal.RED };
+    const modeIcons: Record<string, string> = { standard: "🛡️", auto: "✏️", yolo: "⚠️" };
     this.write(`\n${Terminal.CYAN}${"=".repeat(48)}${Terminal.RESET}\n`);
     this.write(`  Cortex Agent  ${Terminal.GREEN}${model}${Terminal.RESET}  ${Terminal.GRAY}${tools} tools  🟦 TypeScript${Terminal.RESET}\n`);
     this.write(`  权限: ${modeColors[mode] || Terminal.GRAY}${modeIcons[mode] || "?"} ${mode}${Terminal.RESET}  ${Terminal.GRAY}(Shift+Tab 切换)${Terminal.RESET}\n`);

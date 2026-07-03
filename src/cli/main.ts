@@ -134,7 +134,7 @@ async function main(): Promise<void> {
   const query = queryIdx >= 0 ? args[queryIdx + 1] : null;
   const noStream = args.includes("--no-stream");
   const modeIdx = args.indexOf("--mode");
-  const permissionMode = (modeIdx >= 0 ? args[modeIdx + 1] : settings.permission_mode || "standard") as "standard" | "auto-edit" | "yolo";
+  const permissionMode = (modeIdx >= 0 ? args[modeIdx + 1] : settings.permission_mode || "standard") as "standard" | "auto" | "yolo";
 
   const agent = new CortexAgent({
     apiKey: getApiKey(settings),
@@ -179,7 +179,7 @@ async function main(): Promise<void> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   let currentLine = "";
   
-  const modeLabels: Record<string, string> = { standard: "s", "auto-edit": "a", yolo: "y" };
+  const modeLabels: Record<string, string> = { standard: "s", auto: "a", yolo: "y" };
   const showPrompt = () => {
     const pct = agent.contextPct;
     const ml = modeLabels[agent.config.permissionMode] || "?";
@@ -189,9 +189,9 @@ async function main(): Promise<void> {
   // Listen for Shift+Tab (\x1b[Z) to cycle permission mode
   process.stdin.on("keypress", (_str, key) => {
     if (key && key.name === "tab" && key.shift) {
-      const modes = ["standard", "auto-edit", "yolo"];
+      const modes = ["standard", "auto", "yolo"];
       const idx = modes.indexOf(agent.config.permissionMode);
-      const next = modes[(idx + 1) % 3] as "standard" | "auto-edit" | "yolo";
+      const next = modes[(idx + 1) % 3] as "standard" | "auto" | "yolo";
       agent.config.permissionMode = next;
       showPrompt();
       rl.prompt();

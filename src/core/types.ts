@@ -20,7 +20,7 @@ export enum AuditVerdict {
   DENY = "deny",
 }
 
-export const PERMISSION_MODES = ["standard", "auto-edit", "yolo"] as const;
+export const PERMISSION_MODES = ["standard", "auto", "yolo"] as const;
 export type PermissionMode = (typeof PERMISSION_MODES)[number];
 
 // ── 能力令牌 ──

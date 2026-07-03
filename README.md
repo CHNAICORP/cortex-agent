@@ -140,7 +140,7 @@ ctx/
 | 模式 | 行为 |
 |------|------|
 | `standard` 🛡️ | SAFE 自动 / WRITE 区内 / SYSTEM 需确认 |
-| `auto-edit` ✏️ | 自动批准编辑 + SYSTEM 放行 |
+| `auto` ✏️ | 自动批准编辑 + SYSTEM 放行 |
 | `yolo` ⚠️ | 全部放行 (CI/CD) |
 
 ---

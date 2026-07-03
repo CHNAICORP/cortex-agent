@@ -433,7 +433,7 @@ export class CortexAgent {
           [ok, reason] = await this.policy.audit(tc.name, tc.args);
         }
         if (!ok && reason === "confirm") {
-          if (this.config.permissionMode === "yolo" || this.config.permissionMode === "auto-edit") {
+          if (this.config.permissionMode === "yolo" || this.config.permissionMode === "auto") {
             ok = true; reason = "";
           } else {
             try {

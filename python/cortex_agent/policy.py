@@ -117,20 +117,20 @@ class PolicyEngine:
         if mode == "yolo":
             return AuditVerdict.ALLOW
         if risk == RiskLevel.SAFE:
-            if is_outside and mode != "auto-edit":
+            if is_outside and mode != "auto":
                 return AuditVerdict.CONFIRM
             return AuditVerdict.ALLOW
         if risk == RiskLevel.WRITE:
             # 工作区内写操作在所有模式都直接放行
             if not is_outside:
                 return AuditVerdict.ALLOW
-            # auto-edit 模式工作区外写操作也放行
-            if mode == "auto-edit":
+            # auto 模式工作区外写操作也放行
+            if mode == "auto":
                 return AuditVerdict.ALLOW
             return AuditVerdict.CONFIRM
         # SYSTEM
-        # auto-edit 模式系统命令自动放行
-        if mode == "auto-edit":
+        # auto 模式系统命令自动放行
+        if mode == "auto":
             return AuditVerdict.ALLOW
         if mode == "standard":
             return AuditVerdict.CONFIRM

@@ -126,8 +126,8 @@ def main():
     p.add_argument("--list-sessions", action="store_true", help="列出已保存的会话")
     p.add_argument("--new-session", action="store_true", help="强制创建新会话")
     p.add_argument("--init-config", action="store_true", help="创建默认 .cortex/settings.json")
-    p.add_argument("--mode", default=None, choices=["standard","auto-edit","yolo"],
-                   help="权限模式: standard|auto-edit|yolo")
+    p.add_argument("--mode", default=None, choices=["standard","auto","yolo"],
+                   help="权限模式: standard|auto|yolo")
     args = p.parse_args()
 
     if args.version:
@@ -217,8 +217,8 @@ def main():
 
     # REPL
     while True:
-        mode_label = {"standard": f"{term.GREEN}s{term.RESET}", 
-                      "auto-edit": f"{term.YELLOW}a{term.RESET}", 
+        mode_label = {"standard": f"{term.GREEN}s{term.RESET}",
+                      "auto": f"{term.YELLOW}a{term.RESET}",
                       "yolo": f"{term.RED}y{term.RESET}"}.get(agent.config.permission_mode, "?")
         ctx_pct = agent.context_pct
         ctx_color = term.GREEN if ctx_pct < 50 else (term.YELLOW if ctx_pct < 80 else term.RED)
@@ -272,7 +272,7 @@ def main():
         # ── Permission mode switching ──
         if q in ("/mode", "/permissions"):
             m = agent.config.permission_mode
-            print(f"当前: {m}\n可用: {term.GREEN}s/standard{term.RESET} | {term.YELLOW}a/auto-edit{term.RESET} | {term.RED}y/yolo{term.RESET}")
+            print(f"当前: {m}\n可用: {term.GREEN}s/standard{term.RESET} | {term.YELLOW}a/auto{term.RESET} | {term.RED}y/yolo{term.RESET}")
             continue
         if q.startswith("/mode ") or q.startswith("/permissions "):
             result = agent.switch_permission_mode(q.split(" ", 1)[1])

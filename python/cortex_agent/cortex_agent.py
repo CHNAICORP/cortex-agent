@@ -51,7 +51,7 @@ class AuditVerdict(Enum):
     CONFIRM = "confirm"   # 暂停等待用户确认
     DENY = "deny"         # 直接拒绝
 
-PERMISSION_MODES = ("standard", "auto-edit", "yolo")
+PERMISSION_MODES = ("standard", "auto", "yolo")
 
 class Capability(Enum):
     """能力令牌"""
@@ -354,7 +354,7 @@ class AgentConfig:
     memory_enabled: bool = True
     sessions_enabled: bool = True
     # ── Permission model ──
-    permission_mode: str = "standard"   # standard | auto-edit | yolo
+    permission_mode: str = "standard"   # standard | auto | yolo
     permission_remember: bool = True    # 记住用户在会话中的决策
     workspace_only: bool = False        # True=回退到旧沙箱模式
     context_limit: int = 1_000_000     # DeepSeek V4 上下文窗口 (1M tokens)
@@ -475,7 +475,7 @@ class CortexAgent:
         
         模式说明（参考 Claude Code / Codex 设计）:
           standard  — 默认模式，SAFE 工具自动放行，WRITE 工作区内放行，SYSTEM 需确认
-          auto-edit — 自动批准文件编辑，SYSTEM 自动放行
+          auto — 自动批准文件编辑，SYSTEM 自动放行
           yolo      — 全部放行（含路径穿越），CI/CD 场景
         """
         mode = mode.lower().strip()
@@ -483,13 +483,13 @@ class CortexAgent:
             self.config.permission_mode = "standard"
             return "standard — SAFE自动 / WRITE区内 / SYSTEM需确认"
         elif mode in ("a", "auto", "auto-edit", "edit"):
-            self.config.permission_mode = "auto-edit"
-            return "auto-edit — 自动批准编辑 + SYSTEM放行"
+            self.config.permission_mode = "auto"
+            return "auto — 自动批准编辑 + SYSTEM放行"
         elif mode in ("y", "yolo", "full", "bypass"):
             self.config.permission_mode = "yolo"
             return "yolo — 全部放行（⚠️ 路径穿越不设防）"
         else:
-            return f"(x) 未知模式: {mode}\n可用: standard | auto-edit | yolo"
+            return f"(x) 未知模式: {mode}\n可用: standard | auto | yolo"
 
     # ── Agentic Loop ──
 
@@ -643,7 +643,7 @@ class CortexAgent:
                     ok, reason = self.policy.audit(name, args)
                 # ── CONFIRM → 根据权限模式决定 ──
                 if not ok and reason == "confirm":
-                    if self.config.permission_mode in ("yolo", "auto-edit"):
+                    if self.config.permission_mode in ("yolo", "auto"):
                         ok = True; reason = ""
                     elif self._term:
                         ok = self._request_confirmation(name, args, cap_str)
