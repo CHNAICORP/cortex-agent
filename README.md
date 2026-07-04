@@ -5,6 +5,8 @@
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![TypeScript](https://img.shields.io/badge/typescript-5.x-blue.svg)](https://www.typescriptlang.org/)
 [![Node](https://img.shields.io/badge/node-24+-green.svg)](https://nodejs.org/)
+[![PyPI](https://img.shields.io/pypi/v/cortx.svg)](https://pypi.org/project/cortx/)
+[![npm](https://img.shields.io/npm/v/@chnaicorp/cortx.svg)](https://www.npmjs.com/package/@chnaicorp/cortx)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 > **Cortex** = 大脑皮层。如同大脑皮层负责感知推理、血脑屏障严格过滤、海马体持久记忆 — Cortex Agent 将 Agentic Loop（推理）、PolicyEngine（安全）、Memory（记忆）融为一体。
@@ -41,6 +43,33 @@ ctx --model pro             # 指定模型
 # 单次查询
 ctx -q "用 Python 写斐波那契函数"
 ```
+
+---
+
+## 🎯 Agent 自主开发 Demo
+
+> 给 Agent 一句话指令，它自主完成项目规划、架构设计、前后端编码、依赖安装、编译验证、运行调试全流程，**0 人工干预**。
+
+### 🛒 企业级购物网站 — [cortx-demo-shop-app](https://github.com/CHNAICORP/cortx-demo-shop-app)
+
+| 指标 | 数据 |
+|------|------|
+| **源文件数** | 33 个 |
+| **总代码行数** | 2,612 行 |
+| **技术栈** | React + Vite + Express + TypeScript + SQLite + JWT |
+| **Agent 续行轮次** | 3 轮，182 步 |
+| **人工干预** | 0 次 |
+
+```bash
+# 复现 Agent 自主开发过程
+ctx --mode yolo --long --max-rounds 0 -q "请开发设计一个企业级购物网站，完整项目包含：
+1.后端(Node.js+Express+TypeScript) RESTful API(商品列表、商品详情、购物车、订单、用户认证JWT)，
+SQLite数据库含products/users/carts/orders表，密码bcrypt加密，中间件CORS/错误处理/JWT验证。
+2.前端(React+Vite+TypeScript) 首页商品展示、商品详情页、购物车管理、用户登录注册、订单提交。
+3.数据库：SQLite自动建表+种子数据至少10个商品。"
+```
+
+👉 **查看完整项目代码**: [github.com/CHNAICORP/cortx-demo-shop-app](https://github.com/CHNAICORP/cortx-demo-shop-app)
 
 ---
 
@@ -90,8 +119,11 @@ ctx/
 ├── CORTEX.md                    # 项目知识库
 ├── pyproject.toml               # Python 包配置
 ├── package.json                 # npm 包配置
-└── tsconfig.json                # TypeScript 配置
+├── tsconfig.json                # TypeScript 配置
+└── PUBLISH.md                   # 发布指南
 ```
+
+> 💡 **想看 Agent 能做什么？** 查看 [Demo 项目展示](#-agent-自主开发-demo) 或直接访问 [cortx-demo-shop-app](https://github.com/CHNAICORP/cortx-demo-shop-app)
 
 ---
 
