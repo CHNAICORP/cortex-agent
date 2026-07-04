@@ -18,13 +18,14 @@ import * as https from "node:https";
 import * as http from "node:http";
 
 // ── SSRF 防护 (内网 CIDR 黑名单) ──
+// 注意：localhost 和 127.x.x.x 已允许（开发场景）
 const SSRF_BLOCKED_NETS = [
   /^10\./, /^172\.(1[6-9]|2\d|3[01])\./, /^192\.168\./,
-  /^127\./, /^169\.254\./, /^0\.0\.0\./,
+  /^169\.254\./, /^0\.0\.0\./,
 ];
 
 function isPrivateHost(hostname: string): boolean {
-  if (hostname === "::1" || hostname === "localhost" || hostname.startsWith("fe80:")) return true;
+  // 注意：hostname 可能已经是 IP
   const v4m = hostname.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
   if (v4m) hostname = v4m[1];
   for (const net of SSRF_BLOCKED_NETS) {

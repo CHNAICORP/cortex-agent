@@ -42,17 +42,16 @@ function ipInCidr(ip: string, cidr: string): boolean {
 }
 
 async function resolveHostname(host: string): Promise<string[]> {
-  try {
-    const addresses = await dns.promises.resolve4(host);
-    try {
-      const v6 = await dns.promises.resolve6(host);
-      return [...addresses, ...v6];
-    } catch { /* IPv6 not available */ }
-    return addresses;
-  } catch {
-    // Try reverse lookup — if DNS fails, block (rebinding protection)
-    return [];
-  }
+  // 使用 dns.lookup（系统 DNS 解析器）而非 dns.resolve4（c-ares）
+  // 系统解析器兼容企业 DNS / VPN / hosts 文件
+  return new Promise((resolve) => {
+    dns.lookup(host, { all: true, family: 0 }, (err, addresses) => {
+      if (err || !addresses) {
+        return resolve([]);
+      }
+      resolve(addresses.map(a => a.address));
+    });
+  });
 }
 
 export async function checkSsrf(hostOrUrl: string): Promise<[boolean, string]> {
@@ -73,29 +72,20 @@ export async function checkSsrf(hostOrUrl: string): Promise<[boolean, string]> {
     return [true, ""];
   }
 
-  // localhost 允许访问（开发场景必需）
-  // 内网 IP 仍由 CIDR 检查拦截
-
   // Hostname — resolve and check all resolved IPs
-  try {
-    const ips = await resolveHostname(host);
-    if (ips.length > 0) {
-      // DNS succeeded — check if any resolved IP is in blocked range
-      for (const ip of ips) {
-        for (const cidr of SSRF_BLOCKED_NETS) {
-          if (ipInCidr(ip, cidr)) {
-            return [false, `SSRF 防护: ${host} → ${ip} 在禁访范围 ${cidr}`];
-          }
+  const ips = await resolveHostname(host);
+  if (ips.length > 0) {
+    // DNS succeeded — check if any resolved IP is in blocked range
+    for (const ip of ips) {
+      for (const cidr of SSRF_BLOCKED_NETS) {
+        if (ipInCidr(ip, cidr)) {
+          return [false, `SSRF 防护: ${host} → ${ip} 在禁访范围 ${cidr}`];
         }
       }
-      return [true, ""];
     }
-  } catch {
-    // DNS error — fall through to warn+allow
   }
-  // DNS failed: warn but allow (the HTTP layer will do its own isPrivateHost check)
-  // This avoids blocking legitimate external requests when corporate DNS is restricted
-  return [true, `[WARN] SSRF: DNS 无法解析 ${host}，放行 (连接层检查)`];
+  // DNS 失败或解析为空 → 放行（HTTP 层会处理）
+  return [true, ""];
 }
 
 // ── PolicyEngine ──
@@ -236,6 +226,7 @@ export class PolicyEngine {
     // ── 内容审计（始终执行，即使 yolo 模式也不跳过）──
     // 文档: "A dangerous command is always blocked"
     // 判决链: meta lookup → content audit → permission mode → yolo bypass
+    // MCP/BROWSER 能力：跳过内容审计（不是 shell/http 命令）
     let contentOk = true;
     let contentReason = "";
     if (cap === Capability.DB_READ) {
@@ -255,6 +246,7 @@ export class PolicyEngine {
         [contentOk, contentReason] = this.auditPathWrite(args);
       }
     }
+    // MCP / BROWSER: 无内容审计 — 直接进入权限判决
     // 内容审计失败 → 直接拒绝（即使在 yolo 模式下）
     if (!contentOk) return [false, contentReason];
 

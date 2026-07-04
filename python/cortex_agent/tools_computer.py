@@ -16,7 +16,7 @@ from .cortex_agent import registry, RiskLevel, Capability
 @registry.register(
     "截取整个桌面屏幕截图保存到文件。\n"
     "用法: computer_screenshot(path=\"desktop.png\")",
-    risk=RiskLevel.SYSTEM, capability=Capability.SHELL)
+    risk=RiskLevel.SYSTEM, capability=Capability.BROWSER)
 def computer_screenshot(work_dir: str, path: str = "desktop_screenshot.png") -> str:
     d = os.path.realpath(path if os.path.isabs(path) else os.path.join(work_dir, path))
     # workspace 边界检查
@@ -54,7 +54,7 @@ Write-Output "OK"
 @registry.register(
     "模拟鼠标点击桌面坐标。\n"
     "用法: computer_click(x=100, y=200)",
-    risk=RiskLevel.SYSTEM, capability=Capability.SHELL)
+    risk=RiskLevel.SYSTEM, capability=Capability.BROWSER)
 def computer_click(work_dir: str, x: str = "0", y: str = "0") -> str:
     try:
         xi, yi = int(x), int(y)

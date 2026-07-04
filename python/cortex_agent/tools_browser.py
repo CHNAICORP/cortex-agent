@@ -19,11 +19,12 @@ _browser_ws_url = None
 _browser_ws_url = None
 
 def _get_browser_ws() -> str:
-    """获取或启动 Chrome 调试 WebSocket URL。"""
+    """获取或启动 Chrome/Edge 调试 WebSocket URL。
+    如果没有检测到运行中的调试端口，自动启动 MS Edge。"""
     global _browser_ws_url
     if _browser_ws_url:
         return _browser_ws_url
-    import subprocess, urllib.request
+    import subprocess, urllib.request, time as _time
     # 尝试连接已有调试端口
     try:
         resp = urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=2)
@@ -33,18 +34,55 @@ def _get_browser_ws() -> str:
             return _browser_ws_url
     except Exception:
         pass
+    # 自动启动浏览器
+    try:
+        import shutil as _sh
+        # Windows: 优先 msedge，其次 chrome
+        browser_cmd = None
+        for name in ["msedge", "chrome"]:
+            path = _sh.which(name)
+            if path:
+                browser_cmd = [path, "--remote-debugging-port=9222", "--no-first-run", "--no-default-browser-check"]
+                break
+        if not browser_cmd:
+            # 尝试常见安装路径
+            import glob as _glob
+            edge_paths = [
+                os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+                os.path.join(os.environ.get("PROGRAMFILES", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+            ]
+            for p in edge_paths:
+                if os.path.isfile(p):
+                    browser_cmd = [p, "--remote-debugging-port=9222", "--no-first-run", "--no-default-browser-check"]
+                    break
+        if browser_cmd:
+            _sp = __import__('subprocess')
+            _sp.Popen(browser_cmd, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                      creationflags=0x00000008 if os.name == 'nt' else 0)  # DETACHED_PROCESS
+            # 等待浏览器启动
+            for _ in range(15):  # 最多等 7.5 秒
+                _time.sleep(0.5)
+                try:
+                    resp = urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=2)
+                    data = json.loads(resp.read().decode())
+                    _browser_ws_url = data.get("webSocketDebuggerUrl", "")
+                    if _browser_ws_url:
+                        return _browser_ws_url
+                except Exception:
+                    continue
+    except Exception:
+        pass
     return ""
 
 
 @registry.register(
-    "在浏览器中导航到指定 URL。需要先启动浏览器调试端口:\n"
-    "  start msedge --remote-debugging-port=9222\n"
+    "在浏览器中导航到指定 URL。会自动启动浏览器（MS Edge/Chrome）并打开调试端口。\n"
     "用法: browser_navigate(url=\"https://example.com\")",
-    risk=RiskLevel.WRITE, capability=Capability.NET_HTTP)
+    risk=RiskLevel.WRITE, capability=Capability.BROWSER)
 def browser_navigate(work_dir: str, url: str) -> str:
     ws = _get_browser_ws()
     if not ws:
-        return "(x) 浏览器未连接。请在终端执行: start msedge --remote-debugging-port=9222"
+        return "(x) 浏览器自动启动失败。请手动启动: start msedge --remote-debugging-port=9222"
     import http.client
     try:
         conn = http.client.HTTPConnection("127.0.0.1", 9222, timeout=10)
@@ -54,13 +92,11 @@ def browser_navigate(work_dir: str, url: str) -> str:
         pages = json.loads(resp.read().decode())
         conn.close()
         # 在新页面中导航
-        body = json.dumps({"url": url})
         conn = http.client.HTTPConnection("127.0.0.1", 9222, timeout=10)
         conn.request("PUT", "/json/new?" + urllib.parse.urlencode({"url": url}))
         resp = conn.getresponse()
         page_info = json.loads(resp.read().decode())
         conn.close()
-        # 通过 WebSocket 发送 Page.navigate (简化：通过 /json/new?url=)
         title = page_info.get("title", "?")
         ws_url = page_info.get("webSocketDebuggerUrl", "")
         return f"已在浏览器中打开: {url}\n标题: {title}\nWebSocket: {ws_url[:60]}..."
@@ -71,7 +107,7 @@ def browser_navigate(work_dir: str, url: str) -> str:
 @registry.register(
     "获取当前浏览器页面的文本快照（accessibility tree）。\n"
     "用法: browser_snapshot()",
-    risk=RiskLevel.SAFE, capability=Capability.NET_HTTP)
+    risk=RiskLevel.SAFE, capability=Capability.BROWSER)
 def browser_snapshot(work_dir: str) -> str:
     ws = _get_browser_ws()
     if not ws:
@@ -212,7 +248,7 @@ def _cdp_ws_send(ws_url: str, payload: str, timeout: float = 8.0) -> str:
 @registry.register(
     "截取浏览器页面截图保存到文件。\n"
     "用法: browser_screenshot(path=\"browser.png\")",
-    risk=RiskLevel.WRITE, capability=Capability.NET_HTTP)
+    risk=RiskLevel.WRITE, capability=Capability.BROWSER)
 def browser_screenshot(work_dir: str, path: str = "browser_screenshot.png") -> str:
     import json as _j, http.client, base64
     # 1. Get WebSocket URL for a page

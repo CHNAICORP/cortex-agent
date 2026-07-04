@@ -15,10 +15,10 @@ registry.register("执行系统命令", RiskLevel.SYSTEM, Capability.SHELL,
     try {
       const result = isWin
         ? spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", cmd],
-            { cwd: workDir, timeout: 10000, encoding: "utf-8" })
+            { cwd: workDir, timeout: 0, encoding: "utf-8" })
         : spawnSync("bash", ["-c", cmd],
-            { cwd: workDir, timeout: 10000, encoding: "utf-8" });
-      const out = ((result.stdout || "") + (result.stderr || "")).trim().slice(0, 2000) || "(无输出)";
+            { cwd: workDir, timeout: 0, encoding: "utf-8" });
+      const out = ((result.stdout || "") + (result.stderr || "")).trim() || "(无输出)";
       return `exit=${result.status}\n${out}`;
     } catch (e) { return `(x) ${e}`; }
   },
@@ -34,8 +34,8 @@ registry.register("执行 Python 代码", RiskLevel.SYSTEM, Capability.PYTHON,
       const tmp = path.join(require("os").tmpdir(), `ctx_py_${Date.now()}_${rnd}.py`);
       fs.writeFileSync(tmp, code, "utf-8");
       try {
-        const result = spawnSync("python", [tmp], { timeout: 10000, encoding: "utf-8" });
-        const out = ((result.stdout || "") + (result.stderr || "")).trim().slice(0, 3000) || "(无输出)";
+        const result = spawnSync("python", [tmp], { timeout: 0, encoding: "utf-8" });
+        const out = ((result.stdout || "") + (result.stderr || "")).trim() || "(无输出)";
         return `exit=${result.status}\n${out}`;
       } finally {
         // Always clean up temp file even if spawn fails

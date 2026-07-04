@@ -180,9 +180,9 @@ def run_shell_command(work_dir: str, command: str) -> str:
     is_win = platform.system() == "Windows"
     try:
         args = ["powershell","-NoProfile","-NonInteractive","-Command",command] if is_win else shlex.split(command)
-        r = subprocess.run(args, cwd=work_dir, capture_output=True, text=True, timeout=10, shell=False,
+        r = subprocess.run(args, cwd=work_dir, capture_output=True, text=True, timeout=None, shell=False,
                           encoding='utf-8', errors='replace')
-        out = ((r.stdout or "") + (r.stderr or "")).strip()[:2000] or "(无输出)"
+        out = ((r.stdout or "") + (r.stderr or "")).strip() or "(无输出)"
         return f"exit={r.returncode}\n{out}"
     except subprocess.TimeoutExpired: return "(x) 超时"
     except Exception as e: return f"(x) {e}"
@@ -913,53 +913,116 @@ def csv_query(work_dir: str, path: str, query: str = "SELECT * LIMIT 50") -> str
             rows = list(reader)
         if not rows:
             return "(空CSV)"
-        # 简单 SQL 解析: SELECT col1,col2 WHERE col=val ORDER BY col LIMIT n
-        q = query.upper().replace("SELECT ", "").strip()
-        cols = [c.strip() for c in rows[0].keys()]
-        selected = cols
-        where_clause = None
-        order_by = None
+        cols = list(rows[0].keys())
+        # 大小写不敏感的列名查找
+        col_lower = {c.lower(): c for c in cols}
+        def _resolve_col(name: str) -> str:
+            return col_lower.get(name.lower(), name)
+        # ── SQL 解析: SELECT cols FROM table WHERE cond ORDER BY col LIMIT n ──
+        # 不大写整个查询（保留值原始大小写），用 IGNORECASE 正则拆分关键词
+        def _split_kw(text: str, kw: str) -> list:
+            """用大小写不敏感的关键词拆分，返回各部分（不含关键词本身）。"""
+            parts = re.split(r'\s+' + kw + r'\s+', text, maxsplit=1, flags=re.IGNORECASE)
+            return parts
+        # 去掉 SELECT 前缀
+        working = re.sub(r'^\s*SELECT\s+', '', query, flags=re.IGNORECASE).strip()
+        # 分离 LIMIT
         limit = 50
-        if " WHERE " in q:
-            parts = q.split(" WHERE ", 1)
-            q = parts[0]
-            rest = parts[1]
-            if " ORDER BY " in rest:
-                where_clause, order_part = rest.split(" ORDER BY ", 1)
-                order_by = order_part.strip()
-                if " LIMIT " in order_by:
-                    order_by, lim = order_by.split(" LIMIT ", 1)
-                    try: limit = int(lim)
-                    except: pass
-            elif " LIMIT " in rest:
-                where_clause, lim = rest.split(" LIMIT ", 1)
-                try: limit = int(lim)
-                except: pass
-            else:
-                where_clause = rest
-            where_clause = where_clause.strip()
-        if q and q != "*":
-            selected = [c.strip() for c in q.split(",")]
-        # 过滤
+        lim_parts = _split_kw(working, "LIMIT")
+        if len(lim_parts) == 2:
+            working = lim_parts[0].strip()
+            try: limit = int(lim_parts[1].strip())
+            except: pass
+        # 分离 ORDER BY
+        order_by = None
+        ob_parts = _split_kw(working, "ORDER\\s+BY")
+        if len(ob_parts) == 2:
+            working = ob_parts[0].strip()
+            order_by = ob_parts[1].strip()
+        # 分离 WHERE
+        where_clause = None
+        w_parts = _split_kw(working, "WHERE")
+        if len(w_parts) == 2:
+            working = w_parts[0].strip()
+            where_clause = w_parts[1].strip()
+        # 去掉 FROM table
+        from_parts = _split_kw(working, "FROM")
+        if len(from_parts) == 2:
+            working = from_parts[0].strip()
+        # 解析选择的列
+        if working.strip() == "*" or not working.strip():
+            selected = cols
+        else:
+            selected = [_resolve_col(c.strip()) for c in working.split(",")]
+        # ── WHERE 过滤: 支持 =, !=, >, <, >=, <= ──
         if where_clause:
-            m = re.match(r"(\w+)\s*=\s*(.+)", where_clause)
+            m = re.match(r"(\w+)\s*(>=|<=|!=|=|>|<)\s*(.+)", where_clause)
             if m:
-                col, val = m.group(1), m.group(2).strip().strip("'\"")
-                rows = [r for r in rows if r.get(col, "") == val]
-        # 排序
+                col = _resolve_col(m.group(1))
+                op = m.group(2)
+                val = m.group(3).strip().strip("'\"")
+                def _cmp(v):
+                    try:
+                        fv = float(val); fv2 = float(v)
+                    except (ValueError, TypeError):
+                        fv = None
+                    if op == "=": return v == val or (fv is not None and fv2 == fv)
+                    if op == "!=": return v != val
+                    if fv is not None:
+                        if op == ">": return fv2 > fv
+                        if op == "<": return fv2 < fv
+                        if op == ">=": return fv2 >= fv
+                        if op == "<=": return fv2 <= fv
+                    return False
+                rows = [r for r in rows if _cmp(r.get(col, ""))]
+        # ── ORDER BY 排序 ──
         if order_by:
             desc = order_by.endswith(" DESC")
-            col = order_by.replace(" DESC", "").replace(" ASC", "").strip()
-            rows = sorted(rows, key=lambda r: r.get(col, ""), reverse=desc)
+            col = _resolve_col(order_by.replace(" DESC", "").replace(" ASC", "").strip())
+            try:
+                rows = sorted(rows, key=lambda r: float(r.get(col, "0")), reverse=desc)
+            except (ValueError, TypeError):
+                rows = sorted(rows, key=lambda r: r.get(col, ""), reverse=desc)
         rows = rows[:limit]
         lines = [" | ".join(selected)]
-        lines.append("-" * len(lines[0]))
+        lines.append("-" * max(len(lines[0]), 10))
         for r in rows:
-            lines.append(" | ".join(r.get(c, "") for c in selected))
+            lines.append(" | ".join(str(r.get(c, "")) for c in selected))
         return f"({len(rows)} 行)\n" + "\n".join(lines)
     except Exception as e:
         return f"(x) {e}"
 
+
+@registry.register(
+    "列出当前 Agent 已注册的所有工具及其描述和参数定义。\n"
+    "在开始任何任务之前，应先调用此工具了解你拥有哪些能力，再规划行动方案。\n"
+    "返回每个工具的名称、描述、风险等级和参数列表。",
+    risk=RiskLevel.SAFE, capability=Capability.FS_READ)
+def list_tools(work_dir: str) -> str:
+    import json as _j
+    schemas = registry.schemas
+    lines = [f"=== 已注册工具 ({len(schemas)} 个) ===\n"]
+    for s in schemas:
+        fn = s.get("function", {})
+        name = fn.get("name", "?")
+        desc = fn.get("description", "").split("\n")[0][:100]
+        params = fn.get("parameters", {}).get("properties", {})
+        required = fn.get("parameters", {}).get("required", [])
+        meta = registry.meta(name)
+        risk_str = str(meta["risk"]).split(".")[-1] if meta else "?"
+        cap_str = meta["capability"].value if meta else "?"
+        param_parts = []
+        for pname, pinfo in params.items():
+            ptype = pinfo.get("type", "?")
+            req = "必填" if pname in required else "可选"
+            param_parts.append(f"{pname}({ptype},{req})")
+        params_str = ", ".join(param_parts) if param_parts else "无参数"
+        lines.append(f"  ● {name}")
+        lines.append(f"    描述: {desc}")
+        lines.append(f"    风险: {risk_str} | 能力: {cap_str}")
+        lines.append(f"    参数: {params_str}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════

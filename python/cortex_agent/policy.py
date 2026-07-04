@@ -148,6 +148,7 @@ class PolicyEngine:
         返回 (ok, reason) 其中 ok=False 且 reason="confirm" 时需要用户确认。
         
         关键修复: CONFIRM 不短路内容审计 — shell/SQL/Python 危险命令在确认前仍会检测。
+        MCP 和 BROWSER 能力跳过内容审计（不是 shell/http 命令，无需审计）。
         """
         meta = registry.meta(tool_name)
         if meta is None: return False, f"未注册: {tool_name}"
@@ -164,6 +165,7 @@ class PolicyEngine:
         # ── 内容审计（始终执行，即使 yolo 模式也不跳过）──
         # 文档: "A dangerous command is always blocked"
         # 判决链: meta lookup → content audit → permission mode → yolo bypass
+        # MCP/BROWSER 能力：跳过内容审计（不是 shell/http 命令）
         content_ok = True
         content_reason = ""
         if cap == Capability.DB_READ:
@@ -181,6 +183,7 @@ class PolicyEngine:
                 content_ok, content_reason = self._audit_path_write_yolo(args)
             else:
                 content_ok, content_reason = self._audit_path_write(args)
+        # MCP / BROWSER: 无内容审计 — 直接进入权限判决
         # 内容审计失败 → 直接拒绝（即使在 yolo 模式下）
         if not content_ok:
             return False, content_reason

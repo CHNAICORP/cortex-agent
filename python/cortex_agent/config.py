@@ -24,10 +24,10 @@ settings.json 结构:
       "models": { "gpt4": "gpt-4o", "gpt4m": "gpt-4o-mini" }
     }
   },
-  "max_steps": 50,
+  "max_steps": 0,
   "work_dir": "./cortex_workspace",
-  "loop_timeout": 600,
-  "think_timeout": 300,
+  "loop_timeout": 0,
+  "think_timeout": 600,
   "max_rounds": 0,
   "checkpoint_interval": 5,
   "retry_max": 3,
@@ -106,13 +106,38 @@ def load_settings(project_dir: str = None) -> dict:
                     "base_url": "https://api.deepseek.com/v1",
                     "models": {"flash": "deepseek-v4-flash", "pro": "deepseek-v4-pro"}
                 },
-        "glm": {
-            "api_key": "",
-            "base_url": "https://open.bigmodel.cn/api/paas/v4",
-            "models": {}
-        }
+                "openai": {
+                    "api_key": "",
+                    "base_url": "https://api.openai.com/v1",
+                    "models": {
+                        "5.4": "gpt-5.4", "5.4-mini": "gpt-5.4-mini",
+                        "5.2": "gpt-5.2", "4.1": "gpt-4.1",
+                        "4o": "gpt-4o", "4o-mini": "gpt-4o-mini",
+                    }
+                },
+                "glm": {
+                    "api_key": "",
+                    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                    "models": {
+                        "5.2": "glm-5.2", "5.1": "glm-5.1",
+                        "turbo": "glm-5-turbo", "4.7": "glm-4.7",
+                        "4.7-flash": "glm-4.7-flash", "4-long": "glm-4-long",
+                    }
+                },
+                "anthropic": {
+                    "api_key": "",
+                    "base_url": "https://api.anthropic.com",
+                    "models": {
+                        "fable": "claude-fable-5",
+                        "mythos": "claude-mythos-5",
+                        "sonnet": "claude-sonnet-5",
+                        "opus": "claude-opus-4-8",
+                        "opus-pro": "claude-opus-4-7",
+                        "haiku": "claude-haiku-4-5",
+                    }
+                }
             },
-            "max_steps": 10,
+            "max_steps": 0,
             "context_limit": 0,
             "max_tokens": 0,
             "max_input_tokens": 0,
@@ -124,7 +149,7 @@ def load_settings(project_dir: str = None) -> dict:
             "input_warn_pct": 80,
             "input_force_pct": 90,
             # ── ToolExecutor 可调参数 ──
-            "max_result_chars": 2000,
+            "max_result_chars": 10000,
             # ── Memory 注入控制 ──
             "memory_inject_count": 30,
             "permission_mode": "standard",
@@ -200,6 +225,18 @@ def create_default_settings(path: str) -> dict:
                 "base_url": "https://open.bigmodel.cn/api/paas/v4",
                 "models": {},
             },
+            "anthropic": {
+                "api_key": "",
+                "base_url": "https://api.anthropic.com",
+                "models": {
+                    "fable": "claude-fable-5",
+                    "mythos": "claude-mythos-5",
+                    "sonnet": "claude-sonnet-5",
+                    "opus": "claude-opus-4-8",
+                    "opus-pro": "claude-opus-4-7",
+                    "haiku": "claude-haiku-4-5",
+                },
+            },
         },
         "web_search": {
             "provider": "duckduckgo",       # duckduckgo | brave | serpapi | tavily
@@ -209,12 +246,12 @@ def create_default_settings(path: str) -> dict:
             "max_results": 5,
             "timeout": 10,
         },
-        "max_steps": 50,
-        "loop_timeout": 600,
-        "think_timeout": 300,
+        "max_steps": 0,
+        "loop_timeout": 0,
+        "think_timeout": 600,
         "max_rounds": 0,
         "checkpoint_interval": 5,
-        "retry_max": 3,
+        "retry_max": 5,
         "retry_base_delay": 2,
         "compact_threshold": 60,
         "auto_extract_memory": True,
@@ -234,7 +271,7 @@ def create_default_settings(path: str) -> dict:
         "input_warn_pct": 80,
         "input_force_pct": 90,
         # ── ToolExecutor 可调参数 ──
-        "max_result_chars": 2000,
+        "max_result_chars": 10000,
         # ── Memory 注入控制 ──
         "memory_inject_count": 30,
         "mcpServers": {
@@ -285,6 +322,18 @@ def create_default_settings(path: str) -> dict:
       "api_key": "",                          // 填入你的智谱 AI API key
       "base_url": "https://open.bigmodel.cn/api/paas/v4",
       "models": {}
+    },
+    "anthropic": {
+      "api_key": "",                          // 填入你的 Anthropic API key
+      "base_url": "https://api.anthropic.com",
+      "models": {
+        "fable": "claude-fable-5",            // Fable 5 — 最强旗舰 (1M 上下文)
+        "mythos": "claude-mythos-5",          // Mythos 5 — 新一代推理 (1M 上下文)
+        "sonnet": "claude-sonnet-5",          // Sonnet 5 — 均衡高效 (1M 上下文)
+        "opus": "claude-opus-4-8",            // Opus 4.8 — 顶级编码 (200K)
+        "opus-pro": "claude-opus-4-7",        // Opus 4.7 (200K)
+        "haiku": "claude-haiku-4-5"           // Haiku 4.5 — 快速轻量 (200K)
+      }
     }
   },
   "web_search": {
@@ -297,14 +346,14 @@ def create_default_settings(path: str) -> dict:
   },
   
   // ── Agentic Loop 控制 ──
-  "max_steps": 50,                            // 单轮最大思考-行动步数
-  "max_rounds": 0,                            // 最大轮数（0=无限制，用于 --long 模式）
+  "max_steps": 0,                             // 0=无限步数（支持 24h 连续运行）
+  "max_rounds": 0,                            // 0=无限轮数（用于 --long 模式）
   "checkpoint_interval": 5,                  // 每 N 步保存一次断点
-  "retry_max": 3,                             // 工具调用失败重试次数
+  "retry_max": 5,                             // 工具调用失败重试次数
   "retry_base_delay": 2,                      // 重试基础延迟（秒）
   "compact_threshold": 60,                   // 上下文压缩阈值（token 数）
-  "loop_timeout": 600,                        // 单轮超时（秒）
-  "think_timeout": 300,                       // LLM 思考超时（秒）
+  "loop_timeout": 0,                          // 0=无超时（支持 24h 连续运行）
+  "think_timeout": 600,                       // LLM 思考超时（秒）
   
   // ── 权限模式 ──
   "permission_mode": "standard",              // standard | auto | yolo

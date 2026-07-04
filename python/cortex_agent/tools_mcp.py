@@ -162,7 +162,7 @@ def mcp_list_servers(work_dir: str) -> str:
 @registry.register(
     "启动 MCP 服务器并列出其提供的所有工具。\n"
     "用法: mcp_list_tools(server_command=\"npx\", server_args=\"-y @playwright/mcp@latest\")",
-    risk=RiskLevel.SYSTEM, capability=Capability.SHELL)
+    risk=RiskLevel.SYSTEM, capability=Capability.MCP)
 def mcp_list_tools(work_dir: str, server_command: str, server_args: str = "") -> str:
     import json as _j
     cmd = [server_command] + _split_args(server_args) if server_args else [server_command]
@@ -195,7 +195,7 @@ def mcp_list_tools(work_dir: str, server_command: str, server_args: str = "") ->
     "调用 MCP 服务器上的工具。\n"
     "用法: mcp_call_tool(server_command=\"npx\", server_args=\"-y @playwright/mcp@latest\", "
     "tool_name=\"browser_navigate\", tool_args='{\"url\":\"https://example.com\"}')",
-    risk=RiskLevel.SYSTEM, capability=Capability.SHELL)
+    risk=RiskLevel.SYSTEM, capability=Capability.MCP)
 def mcp_call_tool(work_dir: str, server_command: str, server_args: str = "",
                   tool_name: str = "", tool_args: str = "{}") -> str:
     import json as _j
@@ -383,7 +383,7 @@ def mcp_registry(work_dir: str, category: str = "") -> str:
     "一键安装 MCP Server（从注册表）。自动执行 pip/npm 安装命令。\n"
     "用法: mcp_install(server=\"playwright\")  — 安装指定 server\n"
     "      mcp_install(server=\"all\")          — 安装所有无需 API Key 的 server",
-    risk=RiskLevel.WRITE, capability=Capability.SHELL)
+    risk=RiskLevel.WRITE, capability=Capability.MCP)
 def mcp_install(work_dir: str, server: str = "") -> str:
     if not server:
         return ("请指定要安装的 server:\n"
@@ -473,7 +473,7 @@ def _add_mcp_to_settings(key: str, info: dict):
 @registry.register(
     "一键安装并启动 MCP Server，列出其提供的工具。试用的最快方式！\n"
     "用法: mcp_quick(server=\"fetch\")  — 安装+启动+列出工具",
-    risk=RiskLevel.SYSTEM, capability=Capability.SHELL)
+    risk=RiskLevel.SYSTEM, capability=Capability.MCP)
 def mcp_quick(work_dir: str, server: str = "") -> str:
     if not server or server not in MCP_REGISTRY:
         return (f"请指定要试用的 server:\n"

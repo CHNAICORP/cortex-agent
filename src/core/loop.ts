@@ -16,10 +16,11 @@ import { PolicyEngine } from './policy.js';
 import { LLMProvider, ParsedToolCall, resolveCapabilities } from './llm.js';
 export { LLMProvider } from './llm.js';
 import { MemoryStore, SessionStore } from './memory_store.js';
+import { SkillManager } from './skills.js';
 
 // ── 默认系统提示 ──
 const DEFAULT_SYSTEM = [
-  "你是 Cortex Agent，一个具备工具调用能力的 AI 助手。",
+  "你是 Cortex Agent，一个具备工具调用能力的 AI 助手，专为企业级大型项目连续开发而设计。",
   "",
   "== 安全边界 ==",
   "1. 不得执行可能危害系统安全、泄露数据或破坏系统完整性的操作。",
@@ -28,20 +29,29 @@ const DEFAULT_SYSTEM = [
   "4. 不得读取系统敏感文件。",
   "5. 不得使用编码命令或混淆方式执行 shell。",
   "",
-  "== 项目工程指引 ==",
-  "当任务涉及创建或修改多文件项目时，严格遵循以下工作流：",
-  "1. **先规划再执行**：第一步用 write_file 创建 TASKS.md，列出所有需要完成的里程碑和子任务，每个任务用 [ ] 标记未完成。",
-  "2. **分模块推进**：按依赖顺序逐个模块完成（如：项目骨架→数据层→业务逻辑→API→前端→测试），不要同时开多个模块。",
-  "3. **每步验证**：写完一个文件后，如果是代码文件，立即用 exec_command 运行编译或语法检查（如 tsc --noEmit、python -m py_compile、npm run build）。发现错误立即修复。",
-  "4. **更新进度**：每完成一个子任务，用 edit_file 将 TASKS.md 中对应的 [ ] 改为 [x]。这至关重要——续行时你只能通过 TASKS.md 了解当前进度。",
-  "5. **最后全量测试**：所有模块完成后，运行完整构建和测试命令，确保零错误。",
+  "== 工作流程 ==",
+  "1. **发现能力**：每次接到新任务时，第一步先调用 list_tools 了解你拥有哪些工具能力。",
+  "   你会收到每个工具的名称、描述、参数定义。根据这些信息思考最佳行动方案。",
+  "2. **规划方案**：根据任务目标和可用工具，制定行动步骤。复杂任务可先用 task_create 分解为子任务。",
+  "3. **执行并观察**：逐步调用工具执行，观察返回结果（包括错误），据此调整后续行动。",
+  "4. **工具优先**：优先使用专用工具完成任务（如修改文件用 edit_file 而非 shell 命令），",
+  "   仅在无专用工具可用时才使用 run_shell_command。",
   "",
-  "你有多种工具可用——文件读写、代码执行、网络搜索、数据库查询等。",
-  "每次行动前先思考需要什么信息、哪个工具最合适。",
-  "联网搜索或查询实时信息前，先调用 get_current_time 获取当前时间以确保时效性。\n"
-    + "搜索时务必将获取到的具体年份和月份直接写入搜索关键词中（例如搜 '2026年7月 TypeScript 最新版本' 而非 'TypeScript 最新版本'），"
-    + "否则搜索结果可能过期。",
-  "观察工具返回的结果（包括错误），据此调整后续行动，无需等待指令。",
+  "== 企业级大项目工程指引 ==",
+  "你具备连续长时间工作的能力，可以完成 10 万行以上代码的大型项目。遵循以下原则：",
+  "1. **任务分解**：先用 write_file 创建 TASKS.md，将大项目分解为可管理的里程碑和子任务。",
+  "2. **渐进式开发**：按依赖顺序逐个模块完成。每完成一个子任务用 edit_file 更新 TASKS.md 标记 [x]。",
+  "3. **即时验证**：写完代码文件后立即运行编译或语法检查，发现错误立即修复。不要积累错误。",
+  "4. **问题感知与自修复**：当工具返回错误时：",
+  "   - 仔细阅读错误信息，定位问题根源",
+  "   - 检查相关代码文件，理解上下文",
+  "   - 使用 edit_file 修复问题，而非重写整个文件",
+  "   - 修复后重新运行验证，确保问题真正解决",
+  "5. **上下文管理**：当上下文被压缩时，通过读取 TASKS.md 和已有代码文件恢复进度感知。",
+  "6. **最终验证**：所有模块完成后运行完整构建和测试，确保零错误。",
+  "",
+  "联网搜索或查询实时信息前，先调用 get_current_time 获取当前时间以确保时效性。",
+  "搜索时务必将获取到的具体年份和月份直接写入搜索关键词中。",
 ].join("\n");
 
 // ── ContextGovernor ──
@@ -374,7 +384,7 @@ class Observer {
 
 // ── ToolExecutor ──
 export class ToolExecutor {
-  static MAX_RESULT_CHARS = 2000;
+  static MAX_RESULT_CHARS = 10000;
   private reg: typeof registry;
   private workDir: string;
   private timeout: number;
@@ -436,6 +446,7 @@ export class CortexAgent {
   private stepCountTotal = 0;
   private _memory: MemoryStore | null = null;
   private _sessions: SessionStore | null = null;
+  private _skillMgr: SkillManager | null = null;
   private term: {
     thinkToken: (t: string) => void;
     answerToken: (t: string) => void;
@@ -450,9 +461,6 @@ export class CortexAgent {
 
   constructor(config: Partial<AgentConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
-    // Treat 0 as "not set" for timeout fields — fall back to defaults
-    if (!this.config.thinkTimeout) this.config.thinkTimeout = DEFAULT_CONFIG.thinkTimeout;
-    if (!this.config.loopTimeout) this.config.loopTimeout = DEFAULT_CONFIG.loopTimeout;
     let wd = path.resolve(this.config.workDir);
     try {
       fs.mkdirSync(wd, { recursive: true });
@@ -468,8 +476,9 @@ export class CortexAgent {
     // ── 记忆 + 会话存储 ──
     const memoryPath = this.config.memoryDir || path.join(wd, "memory.md");
     const sessionsDir = this.config.sessionsDir || path.join(wd, "sessions");
-    this._memory = this.config.memoryEnabled ? new MemoryStore(memoryPath) : null;
-    this._sessions = this.config.sessionsEnabled ? new SessionStore(sessionsDir) : null;
+this._memory = this.config.memoryEnabled ? new MemoryStore(memoryPath) : null;
+this._sessions = this.config.sessionsEnabled ? new SessionStore(sessionsDir) : null;
+this._skillMgr = new SkillManager(this.config.workDir);
 
     // ── Model capabilities auto-resolve ──
     // contextLimit=0 或 maxTokens=0 时，从模型能力注册表自动解析
@@ -567,9 +576,16 @@ export class CortexAgent {
 
   get sessionIdStr(): string | null { return this.sessionId; }
 
+  /** @internal Public for CLI access — matches Python's observer.traces */
+  get allTraces(): RunTrace[] { return this.observer.traces; }
+
   get lastTrace(): RunTrace | null { return this.trace; }
 
+  /** @internal Public for CLI access — matches Python's skill_mgr */
+  get skillMgr(): SkillManager | null { return this._skillMgr; }
+
   get contextLimit(): number { return this.config.contextLimit; }
+  get contextMessages(): number { return this.ctx.length; }
   get maxInputTokens(): number { return this.governor.maxInputTokens; }
   get maxTokens(): number { return this.config.maxTokens; }
   get inputTokensPct(): number { return this.governor.inputTokensPct(this.ctx); }
@@ -657,13 +673,17 @@ export class CortexAgent {
    */
   async runLong(query: string, maxRounds?: number): Promise<string> {
     const rounds = maxRounds ?? this.config.maxRounds;
-    const effectiveRounds = rounds === 0 ? 999 : rounds;
+    // 0 = truly unlimited auto-continue (user can Ctrl+C to interrupt)
+    const unlimited = (rounds === 0);
 
     let fullResult = "";
-    for (let roundNo = 1; roundNo <= effectiveRounds; roundNo++) {
+    let roundNo = 0;
+    while (true) {
+      roundNo++;
+      if (!unlimited && roundNo > rounds) break;
       if (this.term) {
-        const display = effectiveRounds < 999 ? effectiveRounds : "∞";
-        this.term.write(`\n  \x1b[36m═══ 轮次 ${roundNo}/${display} ═══\x1b[0m\n`);
+        const display = unlimited ? "∞" : `${rounds}`;
+        this.term.write(`\n  \x1b[36m═══ 轮次 ${roundNo}/${display} | 总步数 ${this.stepCountTotal} ═══\x1b[0m\n`);
       }
 
       // 执行一轮：首轮用 run()，后续轮直接调用 _loop（续行提示已在 ctx 中）
@@ -745,11 +765,27 @@ export class CortexAgent {
 
   private _buildContinuationPrompt(): string {
     const tasks = this._readTasks();
+    // Check recent tool calls for errors
+    const recentErrors: string[] = [];
+    if (this.trace && this.trace.steps) {
+      for (const step of this.trace.steps.slice(-5)) {
+        if (!step.success) {
+          recentErrors.push(`  - [${step.toolName}] ${step.resultPreview.slice(0, 200)}`);
+        }
+      }
+    }
+    let errorHint = "";
+    if (recentErrors.length > 0) {
+      errorHint = "\n\n== 最近错误（需要优先修复）==\n"
+        + recentErrors.join("\n")
+        + "\n请优先分析并修复以上错误，再继续新任务。";
+    }
     if (!tasks) {
       return (
         "请继续之前的工作。如果任务已完成，请直接给出最终总结。"
         + "如果还有未完成的步骤，请继续执行。\n"
         + "提示：如果你还没有创建 TASKS.md 来跟踪进度，请先创建一个。"
+        + errorHint
       );
     }
     const prog = CortexAgent._countTaskProgress(tasks);
@@ -762,6 +798,7 @@ export class CortexAgent {
       + "- 如果有未完成的 [ ] 任务，继续执行下一个。\n"
       + "- 如果所有任务都已完成 [x]，请运行最终构建和测试验证，然后给出最终总结。\n"
       + "- 如果发现已完成的部分有错误，优先修复。"
+      + errorHint
     );
   }
 
@@ -834,6 +871,21 @@ export class CortexAgent {
     this.trace = null;
   }
 
+  resumeSession(sessionId: string): boolean {
+    if (!this._sessions) return false;
+    try {
+      const [savedCtx, meta] = this._sessions.load(sessionId);
+      this.ctx = savedCtx as unknown as Message[];
+      this.sessionId = sessionId;
+      this.queryCount = (meta.query_count as number) || 0;
+      this.stepCountTotal = (meta.step_count as number) || 0;
+      this._makeGovernor();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private async _requestConfirmation(
     toolName: string, args: Record<string, unknown>, capability: string,
   ): Promise<boolean> {
@@ -867,7 +919,20 @@ export class CortexAgent {
   private async _loop(maxSteps: number): Promise<string> {
     this.trace = this.observer.createTrace(this.ctx[this.ctx.length - 1]?.content || "");
     if (this.term) this.term.nextRound();
-    for (let stepNo = 1; stepNo <= maxSteps; stepNo++) {
+    // maxSteps=0 → unlimited steps (24h continuous operation)
+    const unlimited = (maxSteps === 0);
+    let stepNo = 0;
+    while (true) {
+      stepNo++;
+      if (!unlimited && stepNo > maxSteps) break;
+      // ── Heartbeat: log progress every 20 steps (observability for long runs) ──
+      if (stepNo % 20 === 0 && this.term) {
+        const elapsed = (Date.now() - this.trace.startTime) / 1000;
+        const ctxPct = ContextGovernor.contextPct(this.ctx, this.config.contextLimit);
+        const cs = this.llm.cacheStats;
+        const cacheStr = cs.calls > 0 ? ` | 缓存 ${cs.hitRate.toFixed(0)}%` : "";
+        this.term.write(`\n  \x1b[90m[心跳] 步骤 ${stepNo} | 耗时 ${elapsed.toFixed(0)}s | 上下文 ${ctxPct}%${cacheStr} | 消息 ${this.ctx.length} 条 | 工具调用 ${this.trace.steps.length} 次\x1b[0m\n`);
+      }
       this.ctx = this.governor.govern(this.ctx);
       const { text, toolCalls, reasoning } = await this._think();
       if (text === null && !toolCalls) {
@@ -962,10 +1027,16 @@ export class CortexAgent {
         }
       }
 
-      const convergence = await this._reflect(this.trace, stepNo, maxSteps);
-      if (convergence !== null) return convergence;
+      // ── Reflect: only check convergence when step limit is set ──
+      if (!unlimited) {
+        const convergence = await this._reflect(this.trace, stepNo, maxSteps);
+        if (convergence !== null) return convergence;
+      }
     }
-    this.trace.stepLimitReached = true;
+    // Only mark step limit reached when not unlimited
+    if (!unlimited) {
+      this.trace.stepLimitReached = true;
+    }
     const msg = "[超步数] 未能完成";
     if (this.term) {
       this.term.closeThinking();
@@ -1038,6 +1109,7 @@ export class CortexAgent {
           t => this.term!.thinkToken(t),
           t => this.term!.answerToken(t),
           thinking,
+          (name, _args) => { if (!name) this.term!.closeThinking(); },
         );
       }
       return this.llm.call(ctx, thinking);

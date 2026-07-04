@@ -32,6 +32,8 @@ export enum Capability {
   PYTHON = "python",
   NET_HTTP = "net:http",
   NET_SEARCH = "net:search",
+  MCP = "mcp",
+  BROWSER = "browser",
 }
 
 // ── 工具元数据 ──
@@ -160,16 +162,16 @@ export const DEFAULT_CONFIG: AgentConfig = {
   baseUrl: "https://api.deepseek.com/v1",
   model: "deepseek-v4-flash",
   workDir: defaultWorkDir(),
-  maxSteps: 50,
-  toolTimeout: 30,
+  maxSteps: 0,               // 0=unlimited (24h continuous operation)
+  toolTimeout: 0,            // 0=no timeout (long builds/tests/browser)
   systemPrompt: "",
   maxContextMsgs: 50,
-  loopTimeout: 600,
-  thinkTimeout: 300,
+  loopTimeout: 0,            // 0=no timeout (24h continuous operation)
+  thinkTimeout: 600,         // single LLM call timeout (10 min for complex reasoning)
   // ── Long-run parameters ──
   maxRounds: 0,              // 0=unlimited auto-continue
   checkpointInterval: 5,    // auto-save every N steps
-  retryMax: 3,              // transient error retry count
+  retryMax: 5,              // transient error retry count (enhanced resilience)
   retryBaseDelay: 2.0,      // exponential backoff base delay (seconds)
   compactThreshold: 60,     // context compaction trigger
   memoryDir: "",
@@ -192,7 +194,7 @@ export const DEFAULT_CONFIG: AgentConfig = {
   inputWarnPct: 80,
   inputForcePct: 90,
   // ── ToolExecutor 可调参数 ──
-  maxResultChars: 2000,
+  maxResultChars: 10000,      // tool result truncation (supports large code files)
   // ── Memory 注入控制 ──
   memoryInjectCount: 30,
 };

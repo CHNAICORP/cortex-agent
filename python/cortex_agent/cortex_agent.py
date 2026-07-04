@@ -14,11 +14,11 @@ Agentic Loop（每轮）:
   → Reflect (熔断 / 原地打转检测 / 步数限制)
 
 工具体系（Capability Token）:
-  FS_READ / FS_WRITE / DB_READ / SHELL / PYTHON / NET_HTTP / NET_SEARCH
+  FS_READ / FS_WRITE / DB_READ / SHELL / PYTHON / NET_HTTP / NET_SEARCH / MCP / BROWSER
 
 核心安全保证:
   - 完整中介: 所有工具调用必经 PolicyEngine.audit()
-  - SSRF 防护: 10 段 CIDR 内网 IP 拦截
+  - SSRF 防护: 8 段 CIDR 内网 IP 拦截
   - SQL 注入防护: 词边界正则 + 仅 SELECT
   - Python 沙箱: 子进程隔离 + builtins 清洗
   - 路径穿越防护: 工作目录归一化 + 越权检测
@@ -61,6 +61,7 @@ class Capability(Enum):
     FS_READ = "fs:read"; FS_WRITE = "fs:write"; DB_READ = "db:read"
     SHELL = "shell"; PYTHON = "python"
     NET_HTTP = "net:http"; NET_SEARCH = "net:search"
+    MCP = "mcp"; BROWSER = "browser"
 
 @dataclass
 class StepRecord:
@@ -91,7 +92,7 @@ _SSRF_BLOCKED_NETS = [
 def check_ssrf(host_or_url: str) -> Tuple[bool, str]:
     """Reusable SSRF check. Resolves host to IP, checks against blocked nets.
     Called at Guard time AND at Act time for DNS-rebinding protection.
-    Default-deny on DNS failure to prevent rebinding attacks."""
+    DNS 失败时放行 — 让 HTTP 层自行处理（企业 DNS/VPN 环境兼容）。"""
     import socket
     host = host_or_url
     m = re.match(r'https?://(?:\[([^\]]+)\]|([^/:]+))', host_or_url)
@@ -103,7 +104,8 @@ def check_ssrf(host_or_url: str) -> Tuple[bool, str]:
         try:
             addr = ipaddress.ip_address(socket.getaddrinfo(host, 80)[0][4][0])
         except Exception:
-            return False, f"SSRF 防护: 无法解析 {host} (DNS失败，默认拒绝)"
+            # DNS 失败 — 放行，让 HTTP 层自行处理
+            return True, ""
     # IPv4-mapped IPv6 → extract IPv4 part
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
         addr = addr.ipv4_mapped
@@ -179,13 +181,13 @@ class ToolExecutor:
     """工具执行器 — 隔离执行 + 智能结果截断。
 
     截断策略（参考 Claude Code tool result handling）:
-      - 默认截断到 2000 字符（可在 settings.json 中通过 max_result_chars 自定义）
+      - 默认截断到 10000 字符（可在 settings.json 中通过 max_result_chars 自定义）
       - 保留首尾内容，中间用省略标记
       - Python 沙箱输出单独截断
     """
-    MAX_RESULT_CHARS = 2000  # 类常量保留作为默认值和向后兼容
+    MAX_RESULT_CHARS = 10000  # 类常量保留作为默认值和向后兼容
 
-    def __init__(self, registry: 'ToolRegistry', work_dir: str, timeout: int = 10, max_result_chars: int = 0):
+    def __init__(self, registry: 'ToolRegistry', work_dir: str, timeout: int = 0, max_result_chars: int = 0):
         self.reg = registry; self.work_dir = work_dir; self.timeout = timeout
         self.max_result_chars = max_result_chars if max_result_chars > 0 else ToolExecutor.MAX_RESULT_CHARS
 
@@ -215,42 +217,52 @@ class ToolExecutor:
 
     def _exec_python_isolated(self, code: str) -> str:
         import tempfile, subprocess, sys as _sys, os as _os
+        # tool_timeout=0 → None（无超时，支持长时间运行）
+        py_timeout = self.timeout if self.timeout and self.timeout > 0 else None
         try:
             tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8")
             try:
                 tmp.write(code); tmp.close()
                 r = subprocess.run([_sys.executable, tmp.name], cwd=self.work_dir,
-                                   capture_output=True, text=True, timeout=self.timeout,
+                                   capture_output=True, text=True, timeout=py_timeout,
                                    env={**_os.environ, "PYTHONPATH": "", "PATH": _os.environ.get("PATH", "")})
-                out = (r.stdout + r.stderr).strip()[:3000] or "(无输出)"
+                out = (r.stdout + r.stderr).strip() or "(无输出)"
                 return f"exit={r.returncode}\n{out}"
             finally: _os.unlink(tmp.name)
-        except subprocess.TimeoutExpired: return f"(x) Python 超时 (>{self.timeout}s)"
+        except subprocess.TimeoutExpired: return f"(x) Python 超时 (>{py_timeout}s)"
         except Exception as e: return f"(x) Python 沙箱异常: {e}"
 
 # ══════════════════════════════════════════════════════════════
 
 DEFAULT_SYSTEM = (
-    "你是 Cortex Agent，一个具备工具调用能力的 AI 助手。\n\n"
+    "你是 Cortex Agent，一个具备工具调用能力的 AI 助手，专为企业级大型项目连续开发而设计。\n\n"
     "== 安全边界 ==\n"
     "1. 不得执行可能危害系统安全、泄露数据或破坏系统完整性的操作。\n"
     "2. 文件操作限于工作目录，不得修改系统配置或系统服务。\n"
     "3. 不得将文件内容通过外部网络发送。\n"
     "4. 不得读取系统敏感文件（如 /etc/passwd、~/.ssh、SAM、注册表）。\n"
     "5. 不得使用编码命令或混淆方式执行 shell。\n\n"
-    "== 项目工程指引 ==\n"
-    "当任务涉及创建或修改多文件项目时，严格遵循以下工作流：\n"
-    "1. **先规划再执行**：第一步用 write_file 创建 TASKS.md，列出所有需要完成的里程碑和子任务，每个任务用 [ ] 标记未完成。\n"
-    "2. **分模块推进**：按依赖顺序逐个模块完成（如：项目骨架→数据层→业务逻辑→API→前端→测试），不要同时开多个模块。\n"
-    "3. **每步验证**：写完一个文件后，如果是代码文件，立即用 exec_command 运行编译或语法检查（如 tsc --noEmit、python -m py_compile、npm run build）。发现错误立即修复。\n"
-    "4. **更新进度**：每完成一个子任务，用 edit_file 将 TASKS.md 中对应的 [ ] 改为 [x]。这至关重要——续行时你只能通过 TASKS.md 了解当前进度。\n"
-    "5. **最后全量测试**：所有模块完成后，运行完整构建和测试命令，确保零错误。\n\n"
-    "你有多种工具可用——文件读写、代码执行、网络搜索、数据库查询等。\n"
-    "每次行动前先思考需要什么信息、哪个工具最合适。\n"
+    "== 工作流程 ==\n"
+    "1. **发现能力**：每次接到新任务时，第一步先调用 list_tools 了解你拥有哪些工具能力。\n"
+    "   你会收到每个工具的名称、描述、参数定义。根据这些信息思考最佳行动方案。\n"
+    "2. **规划方案**：根据任务目标和可用工具，制定行动步骤。复杂任务可先用 task_create 分解为子任务。\n"
+    "3. **执行并观察**：逐步调用工具执行，观察返回结果（包括错误），据此调整后续行动。\n"
+    "4. **工具优先**：优先使用专用工具完成任务（如修改文件用 edit_file 而非 shell 命令），\n"
+    "   仅在无专用工具可用时才使用 run_shell_command。\n\n"
+    "== 企业级大项目工程指引 ==\n"
+    "你具备连续长时间工作的能力，可以完成 10 万行以上代码的大型项目。遵循以下原则：\n"
+    "1. **任务分解**：先用 write_file 创建 TASKS.md，将大项目分解为可管理的里程碑和子任务。\n"
+    "2. **渐进式开发**：按依赖顺序逐个模块完成。每完成一个子任务用 edit_file 更新 TASKS.md 标记 [x]。\n"
+    "3. **即时验证**：写完代码文件后立即运行编译或语法检查，发现错误立即修复。不要积累错误。\n"
+    "4. **问题感知与自修复**：当工具返回错误时：\n"
+    "   - 仔细阅读错误信息，定位问题根源\n"
+    "   - 检查相关代码文件，理解上下文\n"
+    "   - 使用 edit_file 修复问题，而非重写整个文件\n"
+    "   - 修复后重新运行验证，确保问题真正解决\n"
+    "5. **上下文管理**：当上下文被压缩时，通过读取 TASKS.md 和已有代码文件恢复进度感知。\n"
+    "6. **最终验证**：所有模块完成后运行完整构建和测试，确保零错误。\n\n"
     "联网搜索或查询实时信息前，先调用 get_current_time 获取当前时间以确保时效性。\n"
-    "搜索时务必将获取到的具体年份和月份直接写入搜索关键词中（例如搜 '2026年7月 TypeScript 最新版本' 而非 'TypeScript 最新版本'），"
-    "否则搜索结果可能过期。\n"
-    "观察工具返回的结果（包括错误），据此调整后续行动，无需等待指令。"
+    "搜索时务必将获取到的具体年份和月份直接写入搜索关键词中。"
 )
 
 class ContextGovernor:
@@ -602,16 +614,16 @@ class AgentConfig:
     base_url: str = "https://api.deepseek.com/v1"
     model: str = "deepseek-v4-flash"
     work_dir: str = field(default_factory=lambda: os.path.join(os.path.expanduser("~"), ".cortx", "workspace"))
-    max_steps: int = 50
-    tool_timeout: int = 30
+    max_steps: int = 0               # 0=无限（不限制步数，agent 自主决定何时完成）
+    tool_timeout: int = 0            # 0=无超时（允许长时间构建/测试/浏览器操作）
     system_prompt: str = ""
     max_context_msgs: int = 50
-    loop_timeout: float = 600.0
-    think_timeout: float = 300.0
+    loop_timeout: float = 0.0        # 0=无超时（支持 24h 连续运行）
+    think_timeout: float = 600.0     # 单次 LLM 调用超时（10 分钟，复杂推理足够）
     # ── 长时运行参数 ──
     max_rounds: int = 0              # 0=无限续行; >0=最多续行 N 轮
     checkpoint_interval: int = 5     # 每 N 步自动保存检查点
-    retry_max: int = 3               # 瞬态错误重试次数
+    retry_max: int = 5               # 瞬态错误重试次数（增强长时运行韧性）
     retry_base_delay: float = 2.0    # 指数退避基础延迟（秒）
     compact_threshold: int = 60      # 上下文消息数超过此值时触发压缩
     memory_dir: str = ""
@@ -635,7 +647,7 @@ class AgentConfig:
     input_warn_pct: int = 80           # 输入 token 占比达此百分比时触发 WARN 压缩
     input_force_pct: int = 90          # 输入 token 占比达此百分比时触发 FORCE 裁剪
     # ── ToolExecutor 可调参数 ──
-    max_result_chars: int = 2000       # 工具结果截断阈值（字符数）
+    max_result_chars: int = 10000      # 工具结果截断阈值（支持大代码文件查看）
     # ── Memory 注入控制 ──
     memory_inject_count: int = 30      # 注入 system prompt 的最大记忆条数
 
@@ -878,13 +890,18 @@ class CortexAgent:
             最终回答文本
         """
         rounds = max_rounds if max_rounds is not None else self.config.max_rounds
-        if rounds == 0:
-            rounds = 999  # 实际无限（用户可通过 Ctrl+C 中断）
+        # 0 = 真正无限续行（用户可通过 Ctrl+C 中断）
+        unlimited = (rounds == 0)
 
         full_result = ""
-        for round_no in range(1, rounds + 1):
+        round_no = 0
+        while True:
+            round_no += 1
+            if not unlimited and round_no > rounds:
+                break
             if self._term:
-                self._term._w(f"\n  {self._term.CYAN}═══ 轮次 {round_no}/{rounds if rounds < 999 else '∞'} ═══{self._term.RESET}\n")
+                display = f"{rounds}" if not unlimited else "∞"
+                self._term._w(f"\n  {self._term.CYAN}═══ 轮次 {round_no}/{display} | 总步数 {self._step_count_total} ═══{self._term.RESET}\n")
 
             # 执行一轮：首轮用 run()，后续轮直接调用 _loop（续行提示已在 ctx 中）
             if round_no == 1:
@@ -957,11 +974,25 @@ class CortexAgent:
     def _build_continuation_prompt(self) -> str:
         """构建进度感知的续行提示。读取 TASKS.md 并注入到提示中。"""
         tasks = self._read_tasks()
+        # 检查最近的工具调用是否有错误
+        recent_errors = []
+        if self._trace and self._trace.steps:
+            for step in self._trace.steps[-5:]:
+                if not step.success:
+                    recent_errors.append(f"  - [{step.tool_name}] {step.result_preview[:200]}")
+        error_hint = ""
+        if recent_errors:
+            error_hint = (
+                "\n\n== 最近错误（需要优先修复）==\n"
+                + "\n".join(recent_errors)
+                + "\n请优先分析并修复以上错误，再继续新任务。"
+            )
         if not tasks:
             return (
                 "请继续之前的工作。如果任务已完成，请直接给出最终总结。"
                 "如果还有未完成的步骤，请继续执行。\n"
                 "提示：如果你还没有创建 TASKS.md 来跟踪进度，请先创建一个。"
+                + error_hint
             )
         prog = self._count_task_progress(tasks)
         # 截取 TASKS.md 内容（避免注入过长）
@@ -975,6 +1006,7 @@ class CortexAgent:
             "- 如果有未完成的 [ ] 任务，继续执行下一个。\n"
             "- 如果所有任务都已完成 [x]，请运行最终构建和测试验证，然后给出最终总结。\n"
             "- 如果发现已完成的部分有错误，优先修复。"
+            + error_hint
         )
 
     def save_session(self, label: str = None) -> str:
@@ -1063,7 +1095,6 @@ class CortexAgent:
                 m = re.search(r'---\s*(https?://\S+)', step.result_preview)
                 if m:
                     self.memory.append(f"抓取: {m.group(1)}")
-        self._trim_memory_was_here: bool = False  # removed — memories are permanent now
 
     @property
     def session_id(self) -> Optional[str]:
@@ -1074,7 +1105,20 @@ class CortexAgent:
         self._trace = trace; self._label_done = False
         if self._term:
             self._term.next_round()
-        for step_no in range(1, max_steps + 1):
+        # max_steps=0 → 无限步数（支持 24h 连续运行）
+        unlimited = (max_steps == 0)
+        step_no = 0
+        while True:
+            step_no += 1
+            if not unlimited and step_no > max_steps:
+                break
+            # ── 心跳日志：每 20 步打印进度（长时运行可观测性） ──
+            if step_no % 20 == 0 and self._term:
+                elapsed = time.time() - trace.start_time
+                ctx_pct = self.context_pct
+                cs = self.cache_stats
+                cache_str = f" | 缓存 {cs['hit_rate']:.0f}%" if cs["calls"] > 0 else ""
+                self._term._w(f"\n  {self._term.GRAY}[心跳] 步骤 {step_no} | 耗时 {elapsed:.0f}s | 上下文 {ctx_pct}%{cache_str} | 消息 {len(self._ctx)} 条 | 工具调用 {len(trace.steps)} 次{self._term.RESET}\n")
             self._ctx = self.governor.govern(self._ctx)
             content, tool_calls = self._think()
             if content is None and not tool_calls:
@@ -1151,10 +1195,14 @@ class CortexAgent:
                 self._ctx = self.governor.compact(self._ctx, keep_recent=12)
                 if self._term:
                     self._term._w(f"\n  {self._term.GRAY}[上下文已压缩: {len(self._ctx)}条]{self._term.RESET}\n")
-            result = self._reflect(trace, step_no, max_steps)
-            if result is not None: return result
+            # ── Reflect: 仅在有步数限制时检查收敛 ──
+            if not unlimited:
+                result = self._reflect(trace, step_no, max_steps)
+                if result is not None: return result
             self._last_reasoning = None
-        trace.step_limit_reached = True
+        # 仅在有步数限制时标记步数耗尽（无限模式不会到达此处）
+        if not unlimited:
+            trace.step_limit_reached = True
         msg = "[超步数] 未能完成"
         if self._term:
             self._term._w(f"\n{msg}\n")

@@ -251,53 +251,127 @@ registry.register("CSV文件查询", RiskLevel.SAFE, Capability.FS_READ,
         rows.push(row);
       }
       if (!rows.length) return "(空CSV)";
-      // Simple SQL: SELECT col1,col2 WHERE col=val ORDER BY col LIMIT n
-      const q = query.toUpperCase().replace("SELECT ", "").trim();
-      let selected = cols;
-      let whereClause: string | null = null;
-      let orderBy: string | null = null;
+      // 大小写不敏感的列名查找
+      const colLower = new Map<string, string>(cols.map((c: string) => [c.toLowerCase(), c]));
+      const resolveCol = (name: string): string => colLower.get(name.toLowerCase()) || name;
+      // ── SQL 解析: SELECT cols FROM table WHERE cond ORDER BY col LIMIT n ──
+      // 不大写整个查询（保留值原始大小写），用 IGNORECASE 正则拆分关键词
+      const splitKw = (text: string, kw: string): string[] => {
+        const re = new RegExp("\\s+" + kw + "\\s+", "i");
+        const idx = text.search(re);
+        if (idx === -1) return [text];
+        const match = text.match(re)!;
+        return [text.slice(0, idx), text.slice(idx + match[0].length)];
+      };
+      // 去掉 SELECT 前缀
+      let working = query.replace(/^\s*SELECT\s+/i, "").trim();
+      // 分离 LIMIT
       let limit = 50;
-      let working = q;
-      if (working.includes(" WHERE ")) {
-        const parts = working.split(" WHERE ", 2);
-        working = parts[0]; let rest = parts[1];
-        if (rest.includes(" ORDER BY ")) {
-          const obParts = rest.split(" ORDER BY ", 2);
-          whereClause = obParts[0].trim(); orderBy = obParts[1].trim();
-          if (orderBy.includes(" LIMIT ")) {
-            const limParts = orderBy.split(" LIMIT ", 2);
-            orderBy = limParts[0].trim(); limit = parseInt(limParts[1]) || 50;
-          }
-        } else if (rest.includes(" LIMIT ")) {
-          const limParts = rest.split(" LIMIT ", 2);
-          whereClause = limParts[0].trim(); limit = parseInt(limParts[1]) || 50;
-        } else { whereClause = rest.trim(); }
-      } else if (working.includes(" LIMIT ")) {
-        const limParts = working.split(" LIMIT ", 2);
-        working = limParts[0]; limit = parseInt(limParts[1]) || 50;
+      const limParts = splitKw(working, "LIMIT");
+      if (limParts.length === 2) {
+        working = limParts[0].trim();
+        limit = parseInt(limParts[1].trim()) || 50;
       }
-      if (working && working !== "*") selected = working.split(",").map((c: string) => c.trim());
+      // 分离 ORDER BY
+      let orderBy: string | null = null;
+      const obParts = splitKw(working, "ORDER\\s+BY");
+      if (obParts.length === 2) {
+        working = obParts[0].trim();
+        orderBy = obParts[1].trim();
+      }
+      // 分离 WHERE
+      let whereClause: string | null = null;
+      const wParts = splitKw(working, "WHERE");
+      if (wParts.length === 2) {
+        working = wParts[0].trim();
+        whereClause = wParts[1].trim();
+      }
+      // 去掉 FROM table
+      const fromParts = splitKw(working, "FROM");
+      if (fromParts.length === 2) {
+        working = fromParts[0].trim();
+      }
+      // 解析选择的列
+      let selected: string[];
+      if (working.trim() === "*" || !working.trim()) {
+        selected = cols;
+      } else {
+        selected = working.split(",").map((c: string) => resolveCol(c.trim()));
+      }
       let filtered = rows;
+      // ── WHERE 过滤: 支持 =, !=, >, <, >=, <= ──
       if (whereClause) {
-        const m = whereClause.match(/(\w+)\s*=\s*(.+)/);
+        const m = whereClause.match(/(\w+)\s*(>=|<=|!=|=|>|<)\s*(.+)/);
         if (m) {
-          const col = m[1], val = m[2].trim().replace(/^["']/, "").replace(/["']$/, "");
-          filtered = filtered.filter((r: Record<string, string>) => r[col] === val);
+          const col = resolveCol(m[1]);
+          const op = m[2];
+          const val = m[3].trim().replace(/^["']/, "").replace(/["']$/, "");
+          const fv = parseFloat(val);
+          filtered = filtered.filter((r: Record<string, string>) => {
+            const v = r[col] || "";
+            const fv2 = parseFloat(v);
+            const isNum = !isNaN(fv) && !isNaN(fv2);
+            switch (op) {
+              case "=": return v === val || (isNum && fv2 === fv);
+              case "!=": return v !== val;
+              case ">": return isNum ? fv2 > fv : false;
+              case "<": return isNum ? fv2 < fv : false;
+              case ">=": return isNum ? fv2 >= fv : false;
+              case "<=": return isNum ? fv2 <= fv : false;
+              default: return false;
+            }
+          });
         }
       }
+      // ── ORDER BY 排序 ──
       if (orderBy) {
         const desc = orderBy.endsWith(" DESC");
-        const col = orderBy.replace(" DESC", "").replace(" ASC", "").trim();
+        const col = resolveCol(orderBy.replace(" DESC", "").replace(" ASC", "").trim());
         filtered.sort((a: Record<string, string>, b: Record<string, string>) => {
           const av = a[col] || "", bv = b[col] || "";
+          const fav = parseFloat(av), fbv = parseFloat(bv);
+          if (!isNaN(fav) && !isNaN(fbv)) return desc ? fbv - fav : fav - fbv;
           return desc ? bv.localeCompare(av) : av.localeCompare(bv);
         });
       }
       filtered = filtered.slice(0, limit);
-      const outLines = [selected.join(" | "), "-".repeat(selected.join(" | ").length)];
+      const outLines = [selected.join(" | "), "-".repeat(Math.max(selected.join(" | ").length, 10))];
       for (const r of filtered) outLines.push(selected.map((c: string) => r[c] || "").join(" | "));
       return `(${filtered.length} 行)\n` + outLines.join("\n");
     } catch (e) { return `(x) ${e}`; }
+  },
+);
+
+registry.register(
+  "列出当前 Agent 已注册的所有工具及其描述和参数定义。\n在开始任何任务之前，应先调用此工具了解你拥有哪些能力，再规划行动方案。\n返回每个工具的名称、描述、风险等级和参数列表。",
+  RiskLevel.SAFE, Capability.FS_READ,
+  { workDir: "string" },
+  function list_tools(): string {
+    const schemas = registry.schemas;
+    const lines: string[] = [`=== 已注册工具 (${schemas.length} 个) ===\n`];
+    for (const s of schemas) {
+      const fn = s.function;
+      const name = fn.name;
+      const desc = (fn.description || "").split("\n")[0].slice(0, 100);
+      const params = (fn.parameters as any).properties || {};
+      const required: string[] = (fn.parameters as any).required || [];
+      const meta = registry.meta(name);
+      const riskStr = meta ? meta.risk.toString().split(".").pop() : "?";
+      const capStr = meta ? meta.capability : "?";
+      const paramParts: string[] = [];
+      for (const [pname, pinfo] of Object.entries(params)) {
+        const ptype = (pinfo as any).type || "?";
+        const req = required.includes(pname) ? "必填" : "可选";
+        paramParts.push(`${pname}(${ptype},${req})`);
+      }
+      const paramsStr = paramParts.length ? paramParts.join(", ") : "无参数";
+      lines.push(`  ● ${name}`);
+      lines.push(`    描述: ${desc}`);
+      lines.push(`    风险: ${riskStr} | 能力: ${capStr}`);
+      lines.push(`    参数: ${paramsStr}`);
+      lines.push("");
+    }
+    return lines.join("\n");
   },
 );
 

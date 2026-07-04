@@ -1,6 +1,6 @@
 # 发布指南
 
-> **当前版本: 1.0.0**
+> **当前版本: 2.0.0**
 
 ## 包名 vs CLI 命令
 
@@ -42,7 +42,7 @@ rm -rf dist build *.egg-info
 python -m build
 
 # 检查包内容
-tar -tzf dist/ctx-1.0.0.tar.gz | head -20
+tar -tzf dist/ctx-2.0.0.tar.gz | head -20
 
 # 上传到 PyPI
 twine upload dist/* -u __token__ -p <YOUR_PYPI_TOKEN>
@@ -108,16 +108,16 @@ ctx --no-stream -q "hello"
 同步更新 3 个文件的版本号：
 
 ```bash
-# 当前版本: 1.0.0，以下示例升级到 1.0.1
+# 当前版本: 2.0.0，以下示例升级到 2.0.1
 
 # pyproject.toml
-version = "1.0.1"          # 修改此行
+version = "2.0.1"          # 修改此行
 
 # package.json
-"version": "1.0.1"         # 修改此行
+"version": "2.0.1"         # 修改此行
 
 # python/cortex_agent/__init__.py
-__version__ = "1.0.1"      # 修改此行
+__version__ = "2.0.1"      # 修改此行
 ```
 
 ### 3.2 构建 + 发布双平台
@@ -125,8 +125,8 @@ __version__ = "1.0.1"      # 修改此行
 ```bash
 # 1. Git 提交
 git add -A
-git commit -m "🔖 v1.0.1: <更新内容>"
-git tag v1.0.1
+git commit -m "🔖 v2.0.0: <更新内容>"
+git tag v2.0.0
 git push --tags
 
 # 2. PyPI
@@ -137,7 +137,7 @@ twine upload dist/*
 npx tsc && npm publish --access public
 
 # 4. 验证
-pip install --upgrade ctx && ctx --version
+pip install --upgrade cortx && ctx --version
 npm install -g @chnaicorp/cortx@latest && ctx --version
 ```
 
@@ -203,4 +203,4 @@ name = "ctx-xxx"
 
 ### Q: 如何撤回错误版本？
 - PyPI: `twine upload --skip-existing` 重新构建不同版本
-- npm: `npm unpublish cortx@1.0.0`（72小时内）
+- npm: `npm unpublish cortx@2.0.0`（72小时内）

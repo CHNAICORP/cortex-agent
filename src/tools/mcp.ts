@@ -191,7 +191,7 @@ registry.register(
 
 registry.register(
   "启动 MCP 服务器并列出其提供的所有工具。\n用法: mcp_list_tools(serverCommand=\"npx\", serverArgs=\"-y @playwright/mcp@latest\")",
-  RiskLevel.SYSTEM, Capability.SHELL,
+  RiskLevel.SYSTEM, Capability.MCP,
   { workDir: "string", serverCommand: "string", serverArgs: "string" },
   async function mcp_list_tools(_wd: string, args: Record<string, unknown>): Promise<string> {
     const serverCommand = String(args["serverCommand"]);
@@ -218,7 +218,7 @@ registry.register(
 
 registry.register(
   "调用 MCP 服务器上的工具。\n用法: mcp_call_tool(serverCommand=\"npx\", serverArgs=\"-y @playwright/mcp@latest\", toolName=\"browser_navigate\", toolArgs='{\"url\":\"https://example.com\"}')",
-  RiskLevel.SYSTEM, Capability.SHELL,
+  RiskLevel.SYSTEM, Capability.MCP,
   { workDir: "string", serverCommand: "string", serverArgs: "string", toolName: "string", toolArgs: "string" },
   async function mcp_call_tool(_wd: string, args: Record<string, unknown>): Promise<string> {
     const serverCommand = String(args["serverCommand"]);
