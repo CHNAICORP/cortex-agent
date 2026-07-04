@@ -11,7 +11,11 @@ function getMemoryPath(workDir: string): string {
 }
 
 registry.register("记住事实", RiskLevel.SAFE, Capability.FS_WRITE,
-  { workDir: "string", name: "string", description: "string" },
+  {
+    workDir: "工作目录",
+    name: "事实名称",
+    description: "详细描述"
+  },
   function remember_fact(workDir: string, args: Record<string, unknown>): string {
     const name = String(args["name"]);
     const desc = String(args["description"]);
@@ -27,7 +31,10 @@ registry.register("记住事实", RiskLevel.SAFE, Capability.FS_WRITE,
 );
 
 registry.register("回忆事实", RiskLevel.SAFE, Capability.FS_READ,
-  { workDir: "string", query: "string" },
+  {
+    workDir: "工作目录",
+    query: "搜索关键词（可选，留空返回所有记忆）"
+  },
   function recall_fact(workDir: string, args: Record<string, unknown>): string {
     const q = String(args["query"] || "").toLowerCase();
     const mp = getMemoryPath(workDir);
@@ -36,7 +43,7 @@ registry.register("回忆事实", RiskLevel.SAFE, Capability.FS_READ,
     if (!lines.length) return "(没有记住任何事实)";
     const filtered = q ? lines.filter(l => l.toLowerCase().includes(q)) : lines;
     if (!filtered.length) return `(未找到包含 '${q}' 的记忆)`;
-    return filtered.join("\n");
+    return `记忆列表:\n${filtered.join("\n")}`;
   },
 );
 

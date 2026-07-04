@@ -499,7 +499,7 @@ this._skillMgr = new SkillManager(this.config.workDir);
   }
 
   private _makeGovernor(): void {
-    const kb = ContextGovernor.loadKb(process.cwd());
+    const kb = ContextGovernor.loadKb(this.config.workDir);
     // 动态记忆注入：根据记忆条数控制注入量
     let memoryCtx = "";
     if (this._memory) {
