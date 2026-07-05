@@ -1060,11 +1060,16 @@ this._skillMgr = new SkillManager(this.config.workDir);
       if (!toolCalls) {
         this.ctx.push({ role: "assistant", content: text || "" });
         this.trace.finalAnswer = text || "";
-        // Fallback: if text was returned by LLM but not streamed to terminal
-        // (e.g., API returned content without streaming, or retry levels
-        // produced text but answerToken was never called), print it now.
-        if (this.term && text && !this.term.isAnswerShown()) {
-          this.term.writeAnswer(text);
+        // Terminal output: ensure the answer text is visible.
+        // 1) Fallback: if text was returned by LLM but not streamed to terminal
+        //    (e.g., retry levels produced text but answerToken was never called),
+        //    print it now via writeAnswer().
+        // 2) Always write a trailing newline so the REPL prompt (rl.prompt())
+        //    doesn't overwrite the last line of the answer via _refreshLine().
+        if (this.term) {
+          if (text && !this.term.isAnswerShown()) {
+            this.term.writeAnswer(text);
+          }
           this.term.write("\n");
         }
         return this.term ? "" : (text || "");
