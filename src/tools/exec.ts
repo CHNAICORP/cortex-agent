@@ -16,6 +16,9 @@ import { RiskLevel, Capability } from '../core/types.js';
 const INACTIVITY_TIMEOUT = 30;   // 空闲超时（秒）：无输出超过此时间则判定卡死
 const MAX_TIMEOUT = 300;         // 硬上限（秒）：无论如何最多运行 5 分钟
 
+// ── 后台进程注册表 ──
+const _bgProcesses = new Map<number, { proc: any; command: string; startTime: number; logFile: string }>();
+
 /**
  * 使用空闲超时执行子进程（异步）。
  * 
@@ -94,14 +97,26 @@ registry.register("执行系统命令", RiskLevel.SYSTEM, Capability.SHELL,
     const cmd = String(args["command"]);
     // ── 阻塞命令检测 ──
     const blockingPatterns = [
+      // npm/npx
       /\b(npm\s+start|npm\s+run\s+dev|npm\s+run\s+serve)\b/i,
-      /\b(node\s+server|python\s+-m\s+http\.server|php\s+-S)\b/i,
-      /\b(git\s+daemon|serve|run\s+server)\b/i,
       /\b(npx\s+.*serve|npx\s+.*start)\b/i,
+      // Python 服务器
+      /\b(flask\s+run)\b/i,
+      /\b(python\s+manage\.py\s+runserver)\b/i,
+      /\b(uvicorn\s+|gunicorn\s+|hypercorn\s+)\b/i,
+      /\b(python\s+-m\s+http\.server)\b/i,
+      /\b(python\s+app\.py|python\s+server\.py|python\s+main\.py)\b/i,
+      /\b(python\s+run\.py|python\s+start\.py)\b/i,
+      // Node 服务器
+      /\b(node\s+server|node\s+app|node\s+index)\b/i,
+      // 其他
+      /\b(php\s+-S)\b/i,
+      /\b(rails\s+server|rails\s+s)\b/i,
+      /\b(docker\s+run|docker-compose\s+up)\b/i,
     ];
     for (const pattern of blockingPatterns) {
       if (pattern.test(cmd)) {
-        return `(x) 检测到阻塞命令: '${cmd}'\n该命令会启动长期运行的进程（如服务器），无法在工具执行超时内完成。\n\n建议:\n  1. 使用后台运行模式（如 npm start &）\n  2. 使用专门的验证工具检查服务是否正常`;
+        return `(x) 检测到阻塞命令: '${cmd}'\n该命令会启动长期运行的服务器进程，无法在 run_shell_command 中执行。\n\n✅ 正确做法：使用 run_background_command 工具在后台启动服务器，然后用 check_server_status 验证。\n   示例：run_background_command(command='python app.py')\n   然后：check_server_status(url='http://localhost:5000')`;
       }
     }
     const isWin = process.platform === "win32";
@@ -214,5 +229,118 @@ registry.register("更新任务状态", RiskLevel.SAFE, Capability.FS_WRITE,
       }
     }
     return `(x) 未找到任务: ${tid}`;
+  },
+);
+
+// ══════════════════════════════════════════════════════════════
+// 后台进程管理 — 启动服务器、验证状态、停止进程
+// ══════════════════════════════════════════════════════════════
+
+registry.register(
+  "在后台启动长期运行的命令（如 Flask/Express 服务器），立即返回 PID。配合 check_server_status 验证。",
+  RiskLevel.SYSTEM, Capability.SHELL,
+  { workDir: "string", command: "string" },
+  function run_background_command(workDir: string, args: Record<string, unknown>): string {
+    const cmd = String(args["command"]);
+    const isWin = process.platform === "win32";
+    const logFile = path.join(workDir, `.bg_log_${Date.now()}.txt`);
+
+    const cmdArgs = isWin
+      ? ["-NoProfile", "-NonInteractive", "-Command", cmd]
+      : ["-c", cmd];
+    const exe = isWin ? "powershell" : "bash";
+
+    try {
+      const logFd = fs.openSync(logFile, "w");
+      const proc = spawn(exe, cmdArgs, {
+        cwd: workDir,
+        stdio: ["ignore", logFd, logFd],
+        detached: false,
+      });
+      fs.closeSync(logFd);
+
+      const pid = proc.pid;
+      _bgProcesses.set(pid, { proc, command: cmd, startTime: Date.now(), logFile });
+
+      // Check if process crashed immediately (check after 1s)
+      // Note: We can't sleep synchronously in sync context, so we check poll()
+      // The caller should use check_server_status after a brief wait
+      if (proc.exitCode !== null && proc.exitCode !== 0) {
+        let logContent = "";
+        try { logContent = fs.readFileSync(logFile, "utf-8").trim().slice(0, 500); } catch { /* */ }
+        return `(x) 后台进程启动后立即退出 (exit=${proc.exitCode})\n命令: ${cmd}\n日志:\n${logContent}`;
+      }
+
+      return `✅ 后台进程已启动 (PID=${pid})\n命令: ${cmd}\n日志: ${logFile}\n提示: 使用 check_server_status 验证服务是否正常运行\n      使用 stop_background_process(pid=${pid}) 停止进程`;
+    } catch (e) { return `(x) 后台启动失败: ${e}`; }
+  },
+);
+
+registry.register(
+  "检查服务器状态（HTTP 健康检查）。发送 HTTP 请求验证服务是否正常运行。",
+  RiskLevel.SAFE, Capability.NET_HTTP,
+  { workDir: "string", url: "string", expected_status: "number" },
+  async function check_server_status(_wd: string, args: Record<string, unknown>): Promise<string> {
+    const url = String(args["url"]);
+    const expectedStatus = Number(args["expected_status"] || 200);
+    const timeout = 5000;
+
+    // Security: only localhost
+    if (!/https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)/.test(url)) {
+      return `(x) 安全限制：check_server_status 仅允许检查本地服务 (localhost/127.0.0.1)\nURL: ${url}`;
+    }
+
+    try {
+      const resp = await fetch(url, { signal: AbortSignal.timeout(timeout), headers: { "User-Agent": "CortexAgent/HealthCheck" } });
+      const body = await resp.text();
+      const ok = resp.status === expectedStatus;
+      const icon = ok ? "✅" : "⚠";
+      return `${icon} 服务正常运行\nURL: ${url}\nHTTP 状态码: ${resp.status} (期望: ${expectedStatus})\n响应体预览: ${body.slice(0, 200)}`;
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+        return `(x) 服务未启动或端口未监听\nURL: ${url}\n可能的原因:\n  1. 服务器进程未成功启动\n  2. 服务器正在启动中，尚未就绪\n  3. 端口号错误\n建议: 检查后台进程日志，或等待几秒后重试`;
+      }
+      return `(x) 检查失败: ${msg}\nURL: ${url}`;
+    }
+  },
+);
+
+registry.register(
+  "停止后台进程（通过 PID）",
+  RiskLevel.SYSTEM, Capability.SHELL,
+  { workDir: "string", pid: "number" },
+  function stop_background_process(_wd: string, args: Record<string, unknown>): string {
+    const pid = Number(args["pid"]);
+    const info = _bgProcesses.get(pid);
+    if (!info) {
+      try { process.kill(pid); return `✅ 已发送终止信号 (PID=${pid})`; }
+      catch (e) { return `(x) 进程 ${pid} 不在注册表中，且直接终止失败: ${e}`; }
+    }
+
+    try {
+      info.proc.kill("SIGTERM");
+      const elapsed = ((Date.now() - info.startTime) / 1000).toFixed(1);
+      let logTail = "";
+      try { logTail = fs.readFileSync(info.logFile, "utf-8").split("\n").slice(-10).join("\n").trim(); } catch { /* */ }
+      _bgProcesses.delete(pid);
+      return `✅ 后台进程已停止 (PID=${pid})\n命令: ${info.command}\n运行时长: ${elapsed}s\n最后日志:\n${logTail.slice(0, 500)}`;
+    } catch (e) { return `(x) 终止进程 ${pid} 失败: ${e}`; }
+  },
+);
+
+registry.register(
+  "列出所有正在运行的后台进程",
+  RiskLevel.SAFE, Capability.FS_READ,
+  { workDir: "string" },
+  function list_background_processes(): string {
+    if (_bgProcesses.size === 0) return "(无后台进程)";
+    const lines = [`运行中的后台进程 (${_bgProcesses.size} 个):\n`];
+    for (const [pid, info] of _bgProcesses) {
+      const elapsed = ((Date.now() - info.startTime) / 1000).toFixed(0);
+      const alive = info.proc.exitCode === null ? "运行中" : `已退出(exit=${info.proc.exitCode})`;
+      lines.push(`  PID=${pid} | ${alive} | ${elapsed}s | ${info.command.slice(0, 60)}`);
+    }
+    return lines.join("\n");
   },
 );

@@ -30,10 +30,25 @@ _PYTHON_MAX_TIMEOUT = 300    # 硬上限（秒）
 
 # 阻塞命令模式（会启动长期运行的进程）
 _BLOCKING_COMMAND_PATTERNS = [
-    r'\b(npm\s+start|npm\s+run\s+dev|npm\s+run\s+serve)\b',  # npm 启动
-    r'\b(node\s+server|python\s+-m\s+http\.server|php\s+-S)\b',  # 服务器启动
-    r'\b(git\s+daemon|serve|run\s+server)\b',  # 服务器相关
-    r'\b(npx\s+.*serve|npx\s+.*start)\b',  # npx 启动
+    # ── npm/npx ──
+    r'\b(npm\s+start|npm\s+run\s+dev|npm\s+run\s+serve)\b',
+    r'\b(npx\s+.*serve|npx\s+.*start)\b',
+    # ── Python 服务器 ──
+    r'\b(flask\s+run)\b',                              # Flask
+    r'\b(python\s+manage\.py\s+runserver)\b',          # Django
+    r'\b(uvicorn\s+|gunicorn\s+|hypercorn\s+)\b',      # ASGI/WSGI
+    r'\b(python\s+-m\s+http\.server)\b',               # Python HTTP server
+    r'\b(python\s+app\.py|python\s+server\.py|python\s+main\.py)\b',  # 常见服务器入口
+    r'\b(python\s+run\.py|python\s+start\.py)\b',      # 启动脚本
+    # ── Node 服务器 ──
+    r'\b(node\s+server|node\s+app|node\s+index)\b',
+    # ── 其他 ──
+    r'\b(php\s+-S)\b',                                  # PHP 内置服务器
+    r'\b(rails\s+server|rails\s+s)\b',                  # Rails
+    r'\b(go\s+run\s+.*main\.go)\b',                    # Go
+    r'\b(cargo\s+run)\b',                               # Rust
+    r'\b(docker\s+run|docker-compose\s+up)\b',          # Docker
+    r'\b(git\s+daemon)\b',                              # Git daemon
 ]
 
 def set_tool_timeout(seconds: int):
@@ -268,7 +283,11 @@ def run_shell_command(work_dir: str, command: str) -> str:
     # ── 阻塞命令检测 ──
     for pattern in _BLOCKING_COMMAND_PATTERNS:
         if re.search(pattern, command, re.IGNORECASE):
-            return f"(x) 检测到阻塞命令: '{command}'\n该命令会启动长期运行的进程（如服务器），无法在工具执行超时内完成。\n\n建议:\n  1. 使用后台运行模式（如 npm start &）\n  2. 使用专门的验证工具检查服务是否正常\n  3. 使用 Ctrl+C 中断当前命令"
+            return (f"(x) 检测到阻塞命令: '{command}'\n"
+                    f"该命令会启动长期运行的服务器进程，无法在 run_shell_command 中执行。\n\n"
+                    f"✅ 正确做法：使用 run_background_command 工具在后台启动服务器，然后用 check_server_status 验证。\n"
+                    f"   示例：run_background_command(command='python app.py')\n"
+                    f"   然后：check_server_status(url='http://localhost:5000')")
     
     is_win = platform.system() == "Windows"
     args = ["powershell","-NoProfile","-NonInteractive","-Command",command] if is_win else ["bash", "-c", command]
@@ -333,6 +352,181 @@ def run_python(work_dir: str, code: str) -> str:
             return f"exit={retcode}\n{out}"
         finally: _os.unlink(tmp.name)
     except Exception as e: return f"(x) Python 沙箱异常: {e}"
+
+
+# ══════════════════════════════════════════════════════════════
+# 后台进程管理 — 启动服务器、验证状态、停止进程
+# ══════════════════════════════════════════════════════════════
+
+# 模块级存储：后台进程注册表 { pid: { proc, command, start_time, log_file } }
+_bg_processes: dict = {}
+
+
+@registry.register("在后台启动长期运行的命令（如 Flask/Express 服务器），立即返回 PID。"
+                   "用于启动开发服务器、构建守护进程等。配合 check_server_status 验证服务是否正常。",
+                   risk=RiskLevel.SYSTEM, capability=Capability.SHELL)
+def run_background_command(work_dir: str, command: str) -> str:
+    """后台启动命令，立即返回 PID 和日志文件路径。"""
+    os.makedirs(work_dir, exist_ok=True)
+    is_win = platform.system() == "Windows"
+
+    # 日志文件
+    import tempfile
+    log_file = os.path.join(work_dir, f".bg_log_{int(time.time())}.txt")
+
+    if is_win:
+        args = ["powershell", "-NoProfile", "-NonInteractive", "-Command", command]
+    else:
+        args = ["bash", "-c", command]
+
+    try:
+        with open(log_file, "w", encoding="utf-8") as lf:
+            proc = subprocess.Popen(
+                args, cwd=work_dir,
+                stdout=lf, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+            )
+    except Exception as e:
+        return f"(x) 后台启动失败: {e}"
+
+    pid = proc.pid
+    _bg_processes[pid] = {
+        "proc": proc,
+        "command": command,
+        "start_time": time.time(),
+        "log_file": log_file,
+    }
+
+    # 等待短暂时间检查进程是否立即崩溃
+    time.sleep(1)
+    if proc.poll() is not None:
+        # 进程已退出 — 读取日志
+        try:
+            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                log_content = f.read().strip()[:500]
+        except Exception:
+            log_content = "(无法读取日志)"
+        return (f"(x) 后台进程启动后立即退出 (exit={proc.returncode})\n"
+                f"命令: {command}\n"
+                f"日志:\n{log_content}")
+
+    return (f"✅ 后台进程已启动 (PID={pid})\n"
+            f"命令: {command}\n"
+            f"日志: {log_file}\n"
+            f"提示: 使用 check_server_status 验证服务是否正常运行\n"
+            f"      使用 stop_background_process(pid={pid}) 停止进程")
+
+
+@registry.register("检查服务器状态（HTTP 健康检查）。发送 HTTP 请求验证服务是否正常运行。",
+                   risk=RiskLevel.SAFE, capability=Capability.NET_HTTP)
+def check_server_status(work_dir: str, url: str, expected_status: int = 200,
+                        timeout: int = 5, method: str = "GET") -> str:
+    """HTTP 健康检查。"""
+    import urllib.request as _ureq
+
+    # 安全检查：只允许 localhost/127.0.0.1
+    if not re.search(r'https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)', url):
+        return f"(x) 安全限制：check_server_status 仅允许检查本地服务 (localhost/127.0.0.1)\nURL: {url}"
+
+    try:
+        req = _ureq.Request(url, method=method)
+        req.add_header("User-Agent", "CortexAgent/HealthCheck")
+        with _ureq.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+            body = resp.read(1000).decode("utf-8", errors="replace")
+            ok = (status == expected_status) if expected_status else (200 <= status < 400)
+            icon = "✅" if ok else "⚠"
+            return (f"{icon} 服务正常运行\n"
+                    f"URL: {url}\n"
+                    f"HTTP 状态码: {status} (期望: {expected_status})\n"
+                    f"响应体预览: {body[:200]}")
+    except urllib.error.HTTPError as e:
+        return (f"⚠ 服务返回错误\n"
+                f"URL: {url}\n"
+                f"HTTP 状态码: {e.code} (期望: {expected_status})\n"
+                f"错误: {e.reason}")
+    except urllib.error.URLError as e:
+        # 检查是否是连接被拒绝（服务未启动）
+        reason = str(e.reason)
+        if "Connection refused" in reason or "WinError 10061" in reason:
+            return (f"(x) 服务未启动或端口未监听\n"
+                    f"URL: {url}\n"
+                    f"可能的原因:\n"
+                    f"  1. 服务器进程未成功启动\n"
+                    f"  2. 服务器正在启动中，尚未就绪\n"
+                    f"  3. 端口号错误\n"
+                    f"建议: 检查后台进程日志，或等待几秒后重试")
+        return f"(x) 连接失败: {reason}\nURL: {url}"
+    except Exception as e:
+        return f"(x) 检查失败: {e}"
+
+
+@registry.register("停止后台进程（通过 PID）",
+                   risk=RiskLevel.SYSTEM, capability=Capability.SHELL)
+def stop_background_process(work_dir: str, pid: int) -> str:
+    """停止指定 PID 的后台进程。"""
+    pid = int(pid)
+
+    info = _bg_processes.get(pid)
+    if not info:
+        # 尝试直接 kill
+        try:
+            if platform.system() == "Windows":
+                subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                               capture_output=True, timeout=5)
+            else:
+                import signal
+                os.kill(pid, signal.SIGTERM)
+            return f"✅ 已发送终止信号 (PID={pid})"
+        except Exception as e:
+            return f"(x) 进程 {pid} 不在注册表中，且直接终止失败: {e}"
+
+    proc = info["proc"]
+    command = info["command"]
+    log_file = info["log_file"]
+
+    try:
+        proc.terminate()  # 优雅终止
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()  # 强制终止
+            proc.wait(timeout=2)
+    except Exception as e:
+        return f"(x) 终止进程 {pid} 失败: {e}"
+
+    # 读取最后日志
+    log_tail = ""
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+            log_tail = "".join(lines[-10:]).strip()
+    except Exception:
+        pass
+
+    del _bg_processes[pid]
+
+    return (f"✅ 后台进程已停止 (PID={pid})\n"
+            f"命令: {command}\n"
+            f"运行时长: {time.time() - info['start_time']:.1f}s\n"
+            f"最后日志:\n{log_tail[:500]}")
+
+
+@registry.register("列出所有正在运行的后台进程",
+                   risk=RiskLevel.SAFE, capability=Capability.FS_READ)
+def list_background_processes(work_dir: str) -> str:
+    """列出所有通过 run_background_command 启动的后台进程。"""
+    if not _bg_processes:
+        return "(无后台进程)"
+
+    lines = [f"运行中的后台进程 ({len(_bg_processes)} 个):\n"]
+    for pid, info in _bg_processes.items():
+        proc = info["proc"]
+        elapsed = time.time() - info["start_time"]
+        alive = "运行中" if proc.poll() is None else f"已退出(exit={proc.returncode})"
+        lines.append(f"  PID={pid} | {alive} | {elapsed:.0f}s | {info['command'][:60]}")
+
+    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════
