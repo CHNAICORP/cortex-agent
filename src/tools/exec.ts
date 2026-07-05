@@ -260,6 +260,9 @@ registry.register(
       fs.closeSync(logFd);
 
       const pid = proc.pid;
+      if (pid === undefined) {
+        return `(x) 后台进程启动失败: spawn 未返回 PID (进程可能未创建)\n命令: ${cmd}`;
+      }
       _bgProcesses.set(pid, { proc, command: cmd, startTime: Date.now(), logFile });
 
       // Check if process crashed immediately (check after 1s)
