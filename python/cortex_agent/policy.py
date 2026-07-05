@@ -52,12 +52,10 @@ class PolicyEngine:
 
     # Tier 1 regex patterns — context-sensitive detection
     SHELL_BLOCK_RE = [
-        (re.compile(r'(?:^|\s)([d-z]:\\)', re.I),       "禁止访问非 C 盘路径"),
         (re.compile(r'(?:^|\s|;)(?:-[eE][nNcCoOdDeEdDcCoOmMmMaAnNdD]*)\s'),
                                                           "禁止 PowerShell 编码命令 (-e/-en/-enc/-enco/-ec)"),
-        # 禁止递归删除根目录
-        (re.compile(r'remove-item\s+.*-recurse\s+-force', re.I), "禁止递归强制删除"),
-        (re.compile(r'del\s+/[a-z]*s[a-z]*\s+/q', re.I),  "禁止批量静默删除"),
+        # 仅拦截针对根目录的批量静默删除
+        (re.compile(r'del\s+/[a-z]*s[a-z]*\s+/q\s+[a-z]:\\?\s*$', re.I),  "禁止批量静默删除根目录"),
     ]
 
     # Tier 2: WARN — allow execution but inject warning to LLM context
@@ -110,7 +108,8 @@ class PolicyEngine:
         
         设计原则（v1.3.0 放宽）：
           - 内容审计已通过 = 命令不危险
-          - standard 模式：SAFE/WRITE/SYSTEM 工作区内均放行，仅工作区外写操作需确认
+          - 文件操作（SAFE/WRITE）在所有路径都放行 — 工作目录只是默认值，不是沙箱
+          - standard 模式：SYSTEM 工作区内放行，工作区外需确认
           - auto 模式：全部放行
           - yolo 模式：全部放行（内容审计仍执行）
         """
@@ -118,17 +117,12 @@ class PolicyEngine:
         if mode == "yolo":
             return AuditVerdict.ALLOW
         if risk == RiskLevel.SAFE:
-            if is_outside and mode != "auto":
-                return AuditVerdict.CONFIRM
+            # 文件读取操作在所有路径都放行 — 桌面、文档等用户目录都是合法的访问范围
             return AuditVerdict.ALLOW
         if risk == RiskLevel.WRITE:
-            # 工作区内写操作在所有模式都直接放行
-            if not is_outside:
-                return AuditVerdict.ALLOW
-            # auto 模式工作区外写操作也放行
-            if mode == "auto":
-                return AuditVerdict.ALLOW
-            return AuditVerdict.CONFIRM
+            # 文件写操作在所有路径都放行 — 桌面、文档等用户目录都是合法的写入范围
+            # 危险文件扩展名已在内容审计中拦截
+            return AuditVerdict.ALLOW
         # SYSTEM 风险（shell/python 等）
         # 内容审计已通过 → 命令本身不危险
         # auto 模式自动放行
@@ -141,7 +135,10 @@ class PolicyEngine:
         return AuditVerdict.CONFIRM
 
     # All path-like parameter names that need workspace containment checks
-    PATH_PARAMS = {"path", "file_a", "file_b", "source", "target", "pattern"}
+    # Covers both snake_case (Python) and camelCase (TS/LLM) variants for parity
+    PATH_PARAMS = {"path", "file_path", "filepath", "dir_path", "dirpath",
+                   "file_a", "file_b", "fileA", "fileB",
+                   "source", "target", "pattern", "out_path", "outPath"}
 
     def audit(self, tool_name: str, args: dict) -> Tuple[bool, str]:
         """4级判决：allow / warn / confirm / deny。
@@ -178,11 +175,7 @@ class PolicyEngine:
             target = args.get("url") or args.get("query", "")
             content_ok, content_reason = self._audit_url(target)
         elif cap == Capability.FS_WRITE:
-            # yolo 模式跳过路径越权检查，但仍检查危险文件扩展名
-            if self.config and self.config.permission_mode == "yolo":
-                content_ok, content_reason = self._audit_path_write_yolo(args)
-            else:
-                content_ok, content_reason = self._audit_path_write(args)
+            content_ok, content_reason = self._audit_path_write(args)
         # MCP / BROWSER: 无内容审计 — 直接进入权限判决
         # 内容审计失败 → 直接拒绝（即使在 yolo 模式下）
         if not content_ok:
@@ -212,15 +205,7 @@ class PolicyEngine:
         return self.resolve_path(path)
 
     def _audit_path_write(self, args: dict) -> Tuple[bool, str]:
-        path = args.get("path", "")
-        ok, resolved = self.resolve_path(path)
-        if not ok: return ok, resolved
-        ext = os.path.splitext(resolved)[1].lower()
-        if ext in self.FORBIDDEN_EXTS: return False, f"禁止写入 {ext}"
-        return True, resolved
-
-    def _audit_path_write_yolo(self, args: dict) -> Tuple[bool, str]:
-        """yolo 模式：跳过路径越权检查，但仍检查危险文件扩展名。"""
+        """文件写入内容审计：仅检查危险文件扩展名。路径权限由 _check_permission() 处理。"""
         path = args.get("path", "")
         resolved = os.path.realpath(os.path.join(self.work_dir, path))
         ext = os.path.splitext(resolved)[1].lower()

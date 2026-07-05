@@ -156,14 +156,6 @@ registry.register(
 
 // ── RAG 知识检索 (grep fallback) ──
 
-let _ftsIndexed = false;
-
-function buildFtsIndex(workDir: string): void {
-  if (_ftsIndexed) return;
-  // TS version: use in-memory file index with grep fallback
-  _ftsIndexed = true;
-}
-
 registry.register(
   "全文搜索项目知识库。搜索所有 .md/.py/.txt/.json 文件。\n用法: search_knowledge(query=\"agentic loop\")",
   RiskLevel.SAFE, Capability.FS_READ,
@@ -208,7 +200,6 @@ registry.register(
   RiskLevel.SAFE, Capability.FS_READ,
   { workDir: "string" },
   function rebuild_knowledge_index(): string {
-    _ftsIndexed = false;
     return "知识库索引已重建";
   },
 );

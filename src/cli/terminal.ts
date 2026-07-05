@@ -1,13 +1,31 @@
 /**
  * Terminal display — 与 Python terminal.py 对应
- * thinking 深灰 / answer 亮色 / 长思考折叠 / 多轮分隔 / 步骤编号
+ * thinking 深灰 / answer 亮色 / 长思考折叠 / 多轮分隔 / 步骤编号 / 代码写入打字机效果
  */
+
+// 代码写入流式显示的配置
+const CODE_STREAM_CONFIG = {
+  // 小文件 (≤50行): 每行延迟 5ms
+  smallLineDelay: 5,
+  smallThreshold: 50,
+  // 中文件 (≤200行): 每行延迟 2ms
+  mediumLineDelay: 2,
+  mediumThreshold: 200,
+  // 大文件 (>200行): 只显示首尾，每行延迟 1ms
+  largeLineDelay: 1,
+  largeHeadLines: 30,
+  largeTailLines: 10,
+  // 最小内容长度（太短不流式）
+  minLength: 30,
+};
+
 export class Terminal {
   private buf: string[] = [];
   private shownReasoning = false;
   private showingAnswer = false;
   private round = 0;
   private step = 0;
+  private codeStreamEnabled = true;
 
   static readonly DEEP  = "\x1b[38;5;239m";
   static readonly CYAN  = "\x1b[38;5;51m";
@@ -91,6 +109,98 @@ export class Terminal {
       }
       this.buf = [];
     }
+  }
+
+  // ── 代码写入打字机效果 ──
+
+  /** 启用/禁用代码流式显示 */
+  setCodeStream(enabled: boolean) { this.codeStreamEnabled = enabled; }
+
+  /**
+   * 流式显示代码写入过程 — 打字机效果。
+   * 
+   * 策略:
+   *   - 小文件 (≤50行): 全部显示，每行 5ms 延迟
+   *   - 中文件 (≤200行): 全部显示，每行 2ms 延迟
+   *   - 大文件 (>200行): 首尾显示 + 中间省略，每行 1ms 延迟
+   *   - 极短内容 (<30字符): 不流式，直接显示
+   */
+  async codeStream(filePath: string, content: string): Promise<void> {
+    if (!this.codeStreamEnabled || !content || content.length < CODE_STREAM_CONFIG.minLength) return;
+
+    const fileName = filePath.split(/[/\\]/).pop() || filePath;
+    const ext = fileName.split(".").pop()?.toLowerCase() || "";
+    const lines = content.split("\n");
+    const totalLines = lines.length;
+    const totalChars = content.length;
+
+    // 代码颜色: 根据文件类型选色
+    const codeColor = this._codeColor(ext);
+
+    // 头部: 文件名 + 行数
+    this.write(`\n  ${Terminal.DIM}✎ ${Terminal.RESET}${Terminal.CYAN}${fileName}${Terminal.RESET} ${Terminal.GRAY}(${totalLines} 行, ${totalChars.toLocaleString()} 字符)${Terminal.RESET}\n`);
+    this.write(`  ${Terminal.GRAY}┌${"─".repeat(Math.min(fileName.length + 20, 60))}┐${Terminal.RESET}\n`);
+
+    const cfg = CODE_STREAM_CONFIG;
+    let displayLines: string[];
+    let lineDelay: number;
+    let omitted = 0;
+
+    if (totalLines <= cfg.smallThreshold) {
+      displayLines = lines;
+      lineDelay = cfg.smallLineDelay;
+    } else if (totalLines <= cfg.mediumThreshold) {
+      displayLines = lines;
+      lineDelay = cfg.mediumLineDelay;
+    } else {
+      // 大文件: 首尾显示
+      const head = lines.slice(0, cfg.largeHeadLines);
+      const tail = lines.slice(-cfg.largeTailLines);
+      omitted = totalLines - cfg.largeHeadLines - cfg.largeTailLines;
+      displayLines = [...head, `__OMITTED__${omitted}__`, ...tail];
+      lineDelay = cfg.largeLineDelay;
+    }
+
+    // 流式输出每一行
+    for (const line of displayLines) {
+      if (line.startsWith("__OMITTED__")) {
+        const count = parseInt(line.match(/\d+/)?.[0] || "0");
+        this.write(`  ${Terminal.GRAY}│  ... 省略 ${count} 行 ...${Terminal.RESET}\n`);
+      } else {
+        // 截断超长行
+        const displayLine = line.length > 120 ? line.slice(0, 117) + "..." : line;
+        this.write(`  ${Terminal.GRAY}│${Terminal.RESET} ${codeColor}${displayLine}${Terminal.RESET}\n`);
+      }
+      if (lineDelay > 0) {
+        await new Promise(r => setTimeout(r, lineDelay));
+      }
+    }
+
+    // 底部
+    this.write(`  ${Terminal.GRAY}└${"─".repeat(Math.min(fileName.length + 20, 60))}┘${Terminal.RESET}\n`);
+  }
+
+  /** 根据文件扩展名返回代码颜色 */
+  private _codeColor(ext: string): string {
+    const map: Record<string, string> = {
+      ts: "\x1b[38;5;75m",   // 蓝
+      tsx: "\x1b[38;5;75m",
+      js: "\x1b[38;5;221m",  // 黄
+      jsx: "\x1b[38;5;221m",
+      py: "\x1b[38;5;114m",  // 绿
+      html: "\x1b[38;5;209m", // 橙
+      css: "\x1b[38;5;141m",  // 紫
+      json: "\x1b[38;5;215m", // 浅橙
+      md: "\x1b[38;5;250m",   // 浅灰
+      yml: "\x1b[38;5;215m",
+      yaml: "\x1b[38;5;215m",
+      sql: "\x1b[38;5;117m",
+      sh: "\x1b[38;5;114m",
+      go: "\x1b[38;5;81m",
+      rs: "\x1b[38;5;173m",
+      vue: "\x1b[38;5;114m",
+    };
+    return map[ext] || Terminal.DIM;
   }
 
   nextRound() {

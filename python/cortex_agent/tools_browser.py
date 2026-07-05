@@ -20,11 +20,12 @@ _browser_ws_url = None
 
 def _get_browser_ws() -> str:
     """获取或启动 Chrome/Edge 调试 WebSocket URL。
-    如果没有检测到运行中的调试端口，自动启动 MS Edge。"""
+    如果没有检测到运行中的调试端口，自动启动 MS Edge。
+    使用独立的 --user-data-dir 避免与已运行浏览器实例冲突。"""
     global _browser_ws_url
     if _browser_ws_url:
         return _browser_ws_url
-    import subprocess, urllib.request, time as _time
+    import subprocess, urllib.request, time as _time, tempfile
     # 尝试连接已有调试端口
     try:
         resp = urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=2)
@@ -37,12 +38,20 @@ def _get_browser_ws() -> str:
     # 自动启动浏览器
     try:
         import shutil as _sh
+        # 使用独立的 user-data-dir 避免与已运行浏览器实例冲突
+        # 否则 --remote-debugging-port 不会生效（新窗口会附加到已有进程）
+        user_data_dir = os.path.join(tempfile.gettempdir(), "cortex-browser-profile")
+        os.makedirs(user_data_dir, exist_ok=True)
+
         # Windows: 优先 msedge，其次 chrome
         browser_cmd = None
         for name in ["msedge", "chrome"]:
             path = _sh.which(name)
             if path:
-                browser_cmd = [path, "--remote-debugging-port=9222", "--no-first-run", "--no-default-browser-check"]
+                browser_cmd = [path, "--remote-debugging-port=9222",
+                               f"--user-data-dir={user_data_dir}",
+                               "--no-first-run", "--no-default-browser-check",
+                               "--disable-extensions", "--disable-popup-blocking"]
                 break
         if not browser_cmd:
             # 尝试常见安装路径
@@ -53,14 +62,17 @@ def _get_browser_ws() -> str:
             ]
             for p in edge_paths:
                 if os.path.isfile(p):
-                    browser_cmd = [p, "--remote-debugging-port=9222", "--no-first-run", "--no-default-browser-check"]
+                    browser_cmd = [p, "--remote-debugging-port=9222",
+                                   f"--user-data-dir={user_data_dir}",
+                                   "--no-first-run", "--no-default-browser-check",
+                                   "--disable-extensions", "--disable-popup-blocking"]
                     break
         if browser_cmd:
             _sp = __import__('subprocess')
             _sp.Popen(browser_cmd, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
                       creationflags=0x00000008 if os.name == 'nt' else 0)  # DETACHED_PROCESS
             # 等待浏览器启动
-            for _ in range(15):  # 最多等 7.5 秒
+            for _ in range(30):  # 最多等 15 秒
                 _time.sleep(0.5)
                 try:
                     resp = urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=2)
@@ -261,7 +273,7 @@ def browser_screenshot(work_dir: str, path: str = "browser_screenshot.png") -> s
     except Exception as e:
         return f"(x) 无法连接浏览器调试端口 9222: {e}"
     if not pages:
-        return "(x) 浏览器未连接或无打开的页面。\n请先启动: start msedge --remote-debugging-port=9222"
+        return "(x) 浏览器未连接或无打开的页面。\n请先启动: start msedge --remote-debugging-port=9222 --user-data-dir=%TEMP%\\cortex-browser-profile"
     # 使用第一个 page 类型的页面
     target = None
     for p in pages:
@@ -282,9 +294,6 @@ def browser_screenshot(work_dir: str, path: str = "browser_screenshot.png") -> s
         img_b64 = result.get("result", {}).get("data", "")
         if img_b64:
             d = os.path.realpath(path if os.path.isabs(path) else os.path.join(work_dir, path))
-            work_real = os.path.realpath(work_dir)
-            if not d.startswith(work_real + os.sep) and d != work_real:
-                return f"(x) 路径越权: {path} (必须在工作目录内)"
             with open(d, "wb") as f:
                 f.write(base64.b64decode(img_b64))
             return f"浏览器截图已保存: {path} ({os.path.getsize(d):,} bytes)"

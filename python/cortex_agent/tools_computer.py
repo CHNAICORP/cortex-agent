@@ -19,10 +19,6 @@ from .cortex_agent import registry, RiskLevel, Capability
     risk=RiskLevel.SYSTEM, capability=Capability.BROWSER)
 def computer_screenshot(work_dir: str, path: str = "desktop_screenshot.png") -> str:
     d = os.path.realpath(path if os.path.isabs(path) else os.path.join(work_dir, path))
-    # workspace 边界检查
-    work_real = os.path.realpath(work_dir)
-    if not d.startswith(work_real + os.sep) and d != work_real:
-        return f"(x) 路径越权: {path} (必须在工作目录内)"
     try:
         import subprocess, base64
         # PowerShell 单引号字符串防止 $() 注入

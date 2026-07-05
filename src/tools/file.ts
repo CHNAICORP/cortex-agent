@@ -5,7 +5,6 @@ import * as fs from "fs";
 import * as path from "path";
 import { registry } from '../core/registry.js';
 import { RiskLevel, Capability } from '../core/types.js';
-import { checkSsrf } from '../core/policy.js';
 
 registry.register(
   "列出目录内的文件和子目录",
@@ -121,6 +120,14 @@ registry.register("通配符匹配文件", RiskLevel.SAFE, Capability.FS_READ,
       }
     }
     if (!matches.length) return `(无匹配: ${pattern})`;
+    // 按修改时间排序（最近修改在前），与 Python 端对齐
+    matches.sort((a: string, b: string) => {
+      try {
+        return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs;
+      } catch {
+        return 0;
+      }
+    });
     return `(${matches.length} 个匹配)\n` + matches.map((m: string) => `  ${path.relative(base, m)}`).join("\n");
   },
 );
@@ -132,6 +139,12 @@ registry.register("正则搜索文件内容", RiskLevel.SAFE, Capability.FS_READ
     const globFilter = String(args["globFilter"] || ""); const head = Number(args["head"] || 50);
     let regex: RegExp;
     try { regex = new RegExp(pattern); } catch { return "(x) 正则错误"; }
+    // glob 通配符 → 正则（支持 *.ts, *.py 等，与 Python fnmatch 对齐）
+    let globRegex: RegExp | null = null;
+    if (globFilter) {
+      const gr = globFilter.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+      try { globRegex = new RegExp("^" + gr + "$"); } catch { /* invalid glob */ }
+    }
     const base = path.resolve(path.isAbsolute(dirPath) ? dirPath : path.join(workDir, dirPath));
     if (!fs.existsSync(base)) return `(x) 路径不存在: ${dirPath}`;
     const results: string[] = [];
@@ -151,7 +164,7 @@ registry.register("正则搜索文件内容", RiskLevel.SAFE, Capability.FS_READ
         try {
           for (const entry of fs.readdirSync(p, { withFileTypes: true })) {
             if (results.length >= head) return;
-            if (globFilter && !entry.name.match(globFilter)) continue;
+            if (globRegex && !globRegex.test(entry.name)) continue;
             search(path.join(p, entry.name));
           }
         } catch { /* skip unreadable dirs */ }
@@ -375,18 +388,3 @@ registry.register(
   },
 );
 
-registry.register("HTTP请求", RiskLevel.SAFE, Capability.NET_HTTP,
-  { workDir: "string", url: "string", method: "string", body: "string", headers: "string" },
-  async function http_request(_wd: string, args: Record<string, unknown>): Promise<string> {
-    const url = String(args["url"]); const method = String(args["method"] || "GET");
-    try {
-      // SSRF check before making the request
-      if (/^https?:\/\//i.test(url)) {
-        const [ok, reason] = await checkSsrf(url);
-        if (!ok) return `(x) ${reason}`;
-      }
-      const resp = await fetch(url, { method, body: args["body"] ? String(args["body"]) : undefined });
-      return `HTTP ${resp.status}\n${(await resp.text()).slice(0, 2000)}`;
-    } catch (e) { return `(x) ${e}`; }
-  },
-);

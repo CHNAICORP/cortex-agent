@@ -14,32 +14,18 @@
  */
 import { registry } from '../core/registry.js';
 import { RiskLevel, Capability } from '../core/types.js';
+import { checkSsrf } from '../core/policy.js';
 import * as https from "node:https";
 import * as http from "node:http";
 
-// ── SSRF 防护 (内网 CIDR 黑名单) ──
-// 注意：localhost 和 127.x.x.x 已允许（开发场景）
-const SSRF_BLOCKED_NETS = [
-  /^10\./, /^172\.(1[6-9]|2\d|3[01])\./, /^192\.168\./,
-  /^169\.254\./, /^0\.0\.0\./,
-];
-
-function isPrivateHost(hostname: string): boolean {
-  // 注意：hostname 可能已经是 IP
-  const v4m = hostname.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (v4m) hostname = v4m[1];
-  for (const net of SSRF_BLOCKED_NETS) {
-    if (net.test(hostname)) return true;
+async function httpRequest(url: string, method = 'GET', body?: string, timeout = 10000, extraHeaders: Record<string, string> = {}): Promise<string> {
+  const reqUrl = new URL(url);
+  // SSRF check via policy engine (includes DNS resolution + CIDR matching)
+  const [ssrfOk, ssrfMsg] = await checkSsrf(reqUrl.hostname);
+  if (!ssrfOk) {
+    throw new Error(ssrfMsg);
   }
-  return false;
-}
-
-function httpRequest(url: string, method = 'GET', body?: string, timeout = 10000, extraHeaders: Record<string, string> = {}): Promise<string> {
   return new Promise((resolve, reject) => {
-    const reqUrl = new URL(url);
-    if (isPrivateHost(reqUrl.hostname)) {
-      return reject(new Error(`SSRF 防护: 禁止访问内网地址 ${reqUrl.hostname}`));
-    }
     const proxy = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy;
     let hostname = reqUrl.hostname;
     let port = reqUrl.port || (reqUrl.protocol === 'https:' ? 443 : 80);
@@ -76,10 +62,7 @@ function httpRequest(url: string, method = 'GET', body?: string, timeout = 10000
         const loc = res.headers.location;
         try {
           const locUrl = new URL(loc, url);
-          if (isPrivateHost(locUrl.hostname)) {
-            reject(new Error(`SSRF 防护: 重定向到内网地址 ${locUrl.hostname}`));
-            return;
-          }
+          // 仅跟随同域名重定向 — 递归调用 httpRequest 会再次执行 SSRF 检查
           if (locUrl.hostname === reqUrl.hostname) {
             resolve(httpRequest(locUrl.href, method, body, timeout, extraHeaders));
             return;
@@ -121,11 +104,14 @@ function dedupResults(results: SearchItem[]): SearchItem[] {
   const seen = new Set<string>();
   const deduped: SearchItem[] = [];
   for (const item of results) {
+    let key: string;
     try {
       const p = new URL(item.url);
-      const key = (p.hostname || "").toLowerCase() + (p.pathname || "").replace(/\/$/, "").toLowerCase();
-    } catch { /* skip */ }
-    const key = item.url.toLowerCase();
+      // 按 hostname + pathname 去重（忽略尾部斜杠和 query 参数）
+      key = (p.hostname || "").toLowerCase() + (p.pathname || "").replace(/\/$/, "").toLowerCase();
+    } catch {
+      key = item.url.toLowerCase();
+    }
     if (!seen.has(key)) {
       seen.add(key);
       deduped.push(item);
@@ -442,5 +428,22 @@ registry.register(
       const msg = e instanceof Error ? e.message : String(e);
       return `(x) 抓取失败: ${msg} — ${url}`;
     }
+  },
+);
+
+// ── HTTP 请求工具 (从 file.ts 移入，与 web_search/web_fetch 同属网络工具) ──
+registry.register("HTTP请求", RiskLevel.SAFE, Capability.NET_HTTP,
+  { workDir: "string", url: "string", method: "string", body: "string", headers: "string" },
+  async function http_request(_wd: string, args: Record<string, unknown>): Promise<string> {
+    const url = String(args["url"]); const method = String(args["method"] || "GET");
+    try {
+      // SSRF check before making the request
+      if (/^https?:\/\//i.test(url)) {
+        const [ok, reason] = await checkSsrf(url);
+        if (!ok) return `(x) ${reason}`;
+      }
+      const resp = await fetch(url, { method, body: args["body"] ? String(args["body"]) : undefined });
+      return `HTTP ${resp.status}\n${(await resp.text()).slice(0, 2000)}`;
+    } catch (e) { return `(x) ${e}`; }
   },
 );

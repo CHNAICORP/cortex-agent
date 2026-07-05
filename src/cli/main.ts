@@ -21,6 +21,8 @@ async function loadTools(): Promise<void> {
   await import("../tools/mcp.js");
   await import("../tools/browser.js");
   await import("../tools/proxy.js");
+  await import("../tools/subagent.js");
+  await import("../tools/git.js");
   console.error(`[cortex] ${registry.schemaList.length} tools loaded`);
 }
 
@@ -31,11 +33,15 @@ Cortex Agent — Harness Agent 架构 + Agentic Loop 引擎
   ctx                         交互 REPL
   ctx --model pro             指定模型
   ctx -q "hello"             单次查询
+  ctx -p "prompt"            管道模式 (从 stdin 读取输入，非交互)
+  cat file.ts | ctx -p       从管道读取文件内容作为输入
   ctx --no-stream            关闭流式输出
   ctx --resume [id]         恢复上次/指定会话的完整上下文
   ctx --mode yolo            全部放行模式
   ctx --long "task"         长时运行模式（自动续行直到完成）
   ctx --max-rounds N        限制续行轮数（0=无限）
+  ctx --allowed-tools T1,T2 仅允许指定的工具
+  ctx --disallowed-tools T3 禁止指定的工具
   ctx --list-sessions        列出已保存会话
   ctx --resume <SESSION_ID>  恢复到指定会话
   ctx --init-config           创建默认 .cortx/settings.json
@@ -252,6 +258,27 @@ async function main(): Promise<void> {
     compactThreshold: (settings.compact_threshold as number) || 60,
   });
 
+  // ── 加载 Hooks 配置 ──
+  agent.hooks.loadFromConfig(settings);
+  if (agent.hooks.count > 0) {
+    console.error(`[cortex] ${agent.hooks.count} hooks loaded`);
+  }
+
+  // ── 工具白名单/黑名单 ──
+  const allowedToolsIdx = args.indexOf("--allowed-tools");
+  const disallowedToolsIdx = args.indexOf("--disallowed-tools");
+  const allowedTools = allowedToolsIdx >= 0
+    ? (args[allowedToolsIdx + 1] || "").split(",").map(s => s.trim()).filter(Boolean)
+    : null;
+  const disallowedTools = disallowedToolsIdx >= 0
+    ? (args[disallowedToolsIdx + 1] || "").split(",").map(s => s.trim()).filter(Boolean)
+    : null;
+  if (allowedTools || disallowedTools) {
+    agent.setToolFilter(allowedTools, disallowedTools);
+    if (allowedTools) console.error(`[cortex] 工具白名单: ${allowedTools.join(", ")}`);
+    if (disallowedTools) console.error(`[cortex] 工具黑名单: ${disallowedTools.join(", ")}`);
+  }
+
   const term = new Terminal();
   agent.setTerm(term);
 
@@ -286,6 +313,54 @@ async function main(): Promise<void> {
 
   if (!noStream) {
     term.banner(agent.config.model, registry.schemaList.length, agent.config.workDir, agent.config.permissionMode, agent.sessionIdStr || undefined, agent.contextLimit, isResume);
+  }
+
+  // ── 管道模式 (-p) ──
+  // 从 stdin 读取输入，非交互执行，输出结果到 stdout
+  const pipeIdx = args.indexOf("-p");
+  const isPipe = pipeIdx >= 0 || (!process.stdin.isTTY && !query);
+  if (isPipe) {
+    agent.setNonInteractive(true);
+    const pipePrompt = pipeIdx >= 0 ? (args[pipeIdx + 1] || "") : "";
+    let stdinData = "";
+    if (!process.stdin.isTTY) {
+      try {
+        stdinData = await new Promise<string>((resolve, reject) => {
+          let data = "";
+          process.stdin.setEncoding("utf-8");
+          process.stdin.on("data", chunk => data += chunk);
+          process.stdin.on("end", () => resolve(data));
+          process.stdin.on("error", reject);
+          // 5 秒超时
+          setTimeout(() => resolve(data), 5000);
+        });
+      } catch { /* ignore */ }
+    }
+    let combinedQuery = "";
+    if (pipePrompt && stdinData.trim()) {
+      combinedQuery = `${pipePrompt}\n\n--- stdin 内容 ---\n${stdinData.trim()}`;
+    } else if (pipePrompt) {
+      combinedQuery = pipePrompt;
+    } else if (stdinData.trim()) {
+      combinedQuery = stdinData.trim();
+    } else {
+      console.error('[cortex] 管道模式需要提供输入 (-p "prompt" 或 stdin)');
+      return;
+    }
+    const answer = longMode
+      ? await agent.runLong(combinedQuery)
+      : await agent.run(combinedQuery);
+    // 管道模式强制输出结果到 stdout（即使流式模式也输出最终文本）
+    if (noStream) console.log(answer);
+    const trace = agent.lastTrace;
+    if (trace?.steps.length) {
+      const totalMs = trace.steps.reduce((s, st) => s + st.latencyMs, 0);
+      console.error(`\n[审计] ${trace.steps.length} 步, ${totalMs.toFixed(0)}ms`);
+    }
+    if (agent.sessionIdStr) {
+      console.error(`[会话] ${agent.sessionIdStr}`);
+    }
+    return;
   }
 
   if (query) {
@@ -378,7 +453,26 @@ async function main(): Promise<void> {
       console.log(`  \x1b[36m═══ 快捷操作 ═══\x1b[0m`);
       console.log(`  \x1b[36m@filename\x1b[0m       引用文件内容到上下文`);
       console.log(`  \x1b[36m/q, /exit\x1b[0m       退出`);
+      console.log(`  \x1b[36m═══ 钩子 ═══\x1b[0m`);
+      console.log(`  \x1b[36m/hooks\x1b[0m         查看/启停生命周期钩子`);
       showPrompt(); rl.prompt(); continue;
+    }
+    // ── /hooks ──
+    if (q === "/hooks") {
+      const h = agent.hooks;
+      console.log(`  \x1b[36mHooks 系统\x1b[0m (${h.count} 个钩子, ${h.isEnabled() ? "启用" : "禁用"})`);
+      console.log(`  ${"\x1b[90m"}${"─".repeat(40)}${"\x1b[0m"}`);
+      if (h.count === 0) {
+        console.log("  (无已配置的钩子)");
+        console.log(`  ${"\x1b[90m"}在 settings.json 中配置 "hooks" 字段${"\x1b[0m"}`);
+      } else {
+        console.log(`  /hooks on    启用钩子`);
+        console.log(`  /hooks off   禁用钩子`);
+      }
+      showPrompt(); rl.prompt(); continue;
+    }
+    if (q === "/hooks on") { agent.hooks.setEnabled(true); console.log("钩子已启用"); showPrompt(); rl.prompt(); continue; }
+    if (q === "/hooks off") { agent.hooks.setEnabled(false); console.log("钩子已禁用"); showPrompt(); rl.prompt(); continue;
     }
     // ── /tools ──
     if (["/tools", "/t"].includes(q)) {

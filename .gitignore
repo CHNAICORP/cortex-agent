@@ -24,9 +24,16 @@ cortex_workspace/*
 
 # Secrets
 .cortx/settings.json
+.cortx/skills/
 
 # MCP runtime
 .playwright-mcp/
+
+# Test design artifacts
+test_design/
+
+# Sessions
+sessions/
 
 # OS
 .DS_Store

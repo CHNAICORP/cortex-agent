@@ -17,6 +17,10 @@ import { LLMProvider, ParsedToolCall, resolveCapabilities } from './llm.js';
 export { LLMProvider } from './llm.js';
 import { MemoryStore, SessionStore } from './memory_store.js';
 import { SkillManager } from './skills.js';
+import { HookManager } from './hooks.js';
+import { setToolContext, clearToolContext, getToolContext } from './tool_context.js';
+export { HookManager } from './hooks.js';
+export { setToolContext, getToolContext } from './tool_context.js';
 
 // ── 默认系统提示 ──
 const DEFAULT_SYSTEM = [
@@ -74,10 +78,11 @@ const DEFAULT_SYSTEM = [
   "",
   "== 安全边界 ==",
   "1. 不得执行可能危害系统安全、泄露数据或破坏系统完整性的操作。",
-  "2. 文件操作限于工作目录，不得修改系统配置或系统服务。",
+  "2. 不得修改系统配置或系统服务文件（如 C:\\Windows, /etc 等）。",
   "3. 不得将文件内容通过外部网络发送。",
   "4. 不得读取系统敏感文件。",
   "5. 不得使用编码命令或混淆方式执行 shell。",
+  "6. 文件操作可以在用户目录范围内自由进行（桌面、文档、工作目录等）。",
   "",
   "== 企业级大项目工程指引 ==",
   "你具备连续长时间工作的能力，可以完成 10 万行以上代码的大型项目。遵循以下原则：",
@@ -485,6 +490,10 @@ export class CortexAgent {
   private _memory: MemoryStore | null = null;
   private _sessions: SessionStore | null = null;
   private _skillMgr: SkillManager | null = null;
+  private _hooks: HookManager = new HookManager();
+  private _nonInteractive: boolean = false;
+  private _allowedTools: Set<string> | null = null;
+  private _disallowedTools: Set<string> | null = null;
   private term: {
     thinkToken: (t: string) => void;
     answerToken: (t: string) => void;
@@ -493,6 +502,7 @@ export class CortexAgent {
     closeThinking: () => void;
     nextRound: () => void;
     write: (s: string) => void;
+    codeStream: (filePath: string, content: string) => Promise<void>;
   } | null = null;
 
   setTerm(t: typeof this.term) { this.term = t; }
@@ -534,6 +544,63 @@ this._skillMgr = new SkillManager(this.config.workDir);
       maxTokens: this.config.maxTokens,
     });
     this._makeGovernor();
+    this._setupToolContext();
+  }
+
+  /** 设置工具上下文（供 ask_user, spawn_subagent 等工具使用） */
+  private _setupToolContext(): void {
+    setToolContext({
+      workDir: this.config.workDir,
+      nonInteractive: this._nonInteractive,
+      agentConfig: this.config as unknown as Record<string, unknown>,
+      askUser: async (question: string): Promise<string> => {
+        if (this._nonInteractive || !this.term) {
+          return `[非交互模式] ${question}`;
+        }
+        this.term.closeThinking();
+        process.stdout.write(`\n  \x1b[36m💬 Agent 提问:\x1b[0m ${question}\n  \x1b[90m> \x1b[0m`);
+        try {
+          const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+          const ans = await new Promise<string>(resolve => rl.question('', resolve));
+          rl.close();
+          return ans.trim() || "(用户未输入)";
+        } catch {
+          return "(用户未响应)";
+        }
+      },
+      spawnSubagent: async (task: string, model?: string): Promise<string> => {
+        const subConfig: Partial<AgentConfig> = {
+          ...this.config,
+          model: model ? LLMProvider.resolve(model) : this.config.model,
+          maxSteps: 20, // 子代理限制步数
+          maxRounds: 1,  // 子代理不续行
+        };
+        const subAgent = new CortexAgent(subConfig);
+        subAgent._nonInteractive = true;
+        subAgent._hooks = this._hooks; // 共享 hooks
+        subAgent._allowedTools = this._allowedTools;
+        subAgent._disallowedTools = this._disallowedTools;
+        subAgent._setupToolContext();
+        return await subAgent.run(task);
+      },
+    });
+  }
+
+  /** 设置非交互模式（管道/CI） */
+  setNonInteractive(v: boolean): void {
+    this._nonInteractive = v;
+    this._setupToolContext();
+  }
+
+  /** 设置工具白名单/黑名单 */
+  setToolFilter(allowed: string[] | null, disallowed: string[] | null): void {
+    this._allowedTools = allowed ? new Set(allowed) : null;
+    this._disallowedTools = disallowed ? new Set(disallowed) : null;
+  }
+
+  /** 获取 HookManager */
+  get hooks(): HookManager {
+    return this._hooks;
   }
 
   private _makeGovernor(summarySid?: string): void {
@@ -652,13 +719,13 @@ this._skillMgr = new SkillManager(this.config.workDir);
     const m = mode.toLowerCase().trim();
     if (["s", "std", "standard"].includes(m)) {
       this.config.permissionMode = "standard";
-      return "standard — SAFE自动 / WRITE区内 / SYSTEM需确认";
+      return "standard — 文件操作全路径放行 / SYSTEM区内放行";
     } else if (["a", "auto", "auto-edit", "edit"].includes(m)) {
       this.config.permissionMode = "auto";
       return "auto — 自动批准编辑 + SYSTEM放行";
     } else if (["y", "yolo", "full", "bypass"].includes(m)) {
       this.config.permissionMode = "yolo";
-      return "yolo — 全部放行（⚠️ 路径穿越不设防）";
+      return "yolo — 全部放行";
     }
     return `(x) 未知模式: ${mode}\n可用: standard | auto | yolo`;
   }
@@ -977,7 +1044,7 @@ this._skillMgr = new SkillManager(this.config.workDir);
         this.term.write(`\n  \x1b[90m[心跳] 步骤 ${stepNo} | 耗时 ${elapsed.toFixed(0)}s | 上下文 ${ctxPct}%${cacheStr} | 消息 ${this.ctx.length} 条 | 工具调用 ${this.trace.steps.length} 次\x1b[0m\n`);
       }
       this.ctx = this.governor.govern(this.ctx);
-      const { text, toolCalls, reasoning } = await this._think();
+      const { text, toolCalls } = await this._think();
       if (text === null && !toolCalls) {
         const err = this.lastLlmError || "未知错误";
         this.trace.error = `LLM 调用失败: ${err}`;
@@ -1010,7 +1077,13 @@ this._skillMgr = new SkillManager(this.config.workDir);
         if (this.term) this.term.toolStart(tc.name, tc.args);
         let ok: boolean;
         let reason: string;
-        if (cap && this.suspendedCaps.has(cap)) {
+
+        // ── 工具白名单/黑名单过滤 ──
+        if (this._allowedTools && !this._allowedTools.has(tc.name)) {
+          ok = false; reason = `工具 ${tc.name} 不在白名单中`;
+        } else if (this._disallowedTools && this._disallowedTools.has(tc.name)) {
+          ok = false; reason = `工具 ${tc.name} 已被黑名单禁止`;
+        } else if (cap && this.suspendedCaps.has(cap)) {
           ok = false; reason = `能力 ${cap} 已被暂停`;
         } else {
           [ok, reason] = await this.policy.audit(tc.name, tc.args);
@@ -1040,13 +1113,40 @@ this._skillMgr = new SkillManager(this.config.workDir);
         let result: string;
         if (!ok) {
           result = reason;
-        } else if (reason.startsWith(PolicyEngine.WARN_PREFIX)) {
-          // WARN tier: execute but annotate warning to LLM context (与 Python 对齐)
-          const warnMsg = reason.slice(PolicyEngine.WARN_PREFIX.length);
-          result = await Promise.resolve(this.executor.execute(tc.name, tc.args));
-          result = `[注意: ${warnMsg}]\n${result}`;
         } else {
-          result = await Promise.resolve(this.executor.execute(tc.name, tc.args));
+          // ── PreToolUse 钩子 ──
+          const preHook = await this._hooks.runPreToolUse({
+            toolName: tc.name, args: tc.args, workDir: this.config.workDir,
+          });
+          if (preHook.block) {
+            ok = false;
+            result = preHook.message;
+          } else {
+            // ── 代码写入打字机效果：在 write_file/edit_file 执行前流式显示代码 ──
+            if (this.term && (tc.name === "write_file" || tc.name === "edit_file")) {
+              const content = tc.name === "write_file"
+                ? String(tc.args["content"] || "")
+                : String(tc.args["newString"] || tc.args["new_string"] || "");
+              const filePath = String(tc.args["filePath"] || tc.args["path"] || tc.args["file_path"] || "");
+              if (content && content.length >= 30) {
+                await this.term.codeStream(filePath, content);
+              }
+            }
+            if (reason.startsWith(PolicyEngine.WARN_PREFIX)) {
+              // WARN tier: execute but annotate warning to LLM context (与 Python 对齐)
+              const warnMsg = reason.slice(PolicyEngine.WARN_PREFIX.length);
+              result = await Promise.resolve(this.executor.execute(tc.name, tc.args));
+              result = `[注意: ${warnMsg}]\n${result}`;
+            } else {
+              result = await Promise.resolve(this.executor.execute(tc.name, tc.args));
+            }
+            // ── PostToolUse 钩子 ──
+            const postHook = await this._hooks.runPostToolUse({
+              toolName: tc.name, args: tc.args, result, workDir: this.config.workDir,
+            });
+            if (preHook.append) result += `\n${preHook.append}`;
+            if (postHook.append) result += `\n${postHook.append}`;
+          }
         }
 
         const latency = Date.now() - t0;

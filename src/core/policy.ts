@@ -121,11 +121,9 @@ export class PolicyEngine {
 
   // Tier 1 regex patterns — context-sensitive shell detection
   static SHELL_BLOCK_RE: [RegExp, string][] = [
-    [/(?:^|\s)([d-z]:\\)/i,           "禁止访问非 C 盘路径"],
     [/(?:^|\s|;)(?:-[eE][nNcCoOdDeEdDcCoOmMmMaAnNdD]*)\s/, "禁止 PowerShell 编码命令 (-e/-en/-enc)"],
-    // 禁止递归删除根目录
-    [/remove-item\s+.*-recurse\s+-force/i, "禁止递归强制删除"],
-    [/del\s+\/[a-z]*s[a-z]*\s+\/q/i,  "禁止批量静默删除"],
+    // 仅拦截针对根目录的批量静默删除
+    [/del\s+\/[a-z]*s[a-z]*\s+\/q\s+[a-z]:\\?\s*$/i,  "禁止批量静默删除根目录"],
   ];
 
   static SHELL_WARN_SUBSTR = [
@@ -186,15 +184,14 @@ export class PolicyEngine {
     const mode = this.config.permissionMode;
     if (mode === "yolo") return AuditVerdict.ALLOW;
     if (risk === RiskLevel.SAFE) {
-      if (isOutside && mode !== "auto") return AuditVerdict.CONFIRM;
+      // 文件读取操作在所有路径都放行 — 工作目录只是默认值，不是沙箱
+      // 桌面、文档等用户目录都是合法的访问范围
       return AuditVerdict.ALLOW;
     }
     if (risk === RiskLevel.WRITE) {
-      // 工作区内写操作在所有模式都放行
-      if (!isOutside) return AuditVerdict.ALLOW;
-      // 工作区外的写操作在 auto 模式也放行
-      if (mode === "auto") return AuditVerdict.ALLOW;
-      return AuditVerdict.CONFIRM;
+      // 文件写操作在所有路径都放行 — 桌面、文档等用户目录都是合法的写入范围
+      // 危险文件扩展名已在内容审计中拦截
+      return AuditVerdict.ALLOW;
     }
     // SYSTEM 风险（shell/python 等）
     // 内容审计已通过 → 命令本身不危险
@@ -239,12 +236,7 @@ export class PolicyEngine {
       const target = String(args["url"] || args["query"] || "");
       [contentOk, contentReason] = await this.auditUrl(target);
     } else if (cap === Capability.FS_WRITE) {
-      // yolo 模式跳过路径越权检查，但仍检查危险文件扩展名
-      if (this.config.permissionMode === "yolo") {
-        [contentOk, contentReason] = this.auditPathWriteYolo(args);
-      } else {
-        [contentOk, contentReason] = this.auditPathWrite(args);
-      }
+      [contentOk, contentReason] = this.auditPathWrite(args);
     }
     // MCP / BROWSER: 无内容审计 — 直接进入权限判决
     // 内容审计失败 → 直接拒绝（即使在 yolo 模式下）
@@ -260,21 +252,8 @@ export class PolicyEngine {
     return [true, contentReason];
   }
 
+  /** 文件写入内容审计：仅检查危险文件扩展名。路径权限由 checkPermission() 处理。 */
   private auditPathWrite(args: Record<string, unknown>): [boolean, string] {
-    const userPath = String(args["path"] || args["filePath"] || args["source"] || "");
-    const full = path.resolve(this.workDir, userPath);
-    // Check workspace containment
-    const sep = path.sep;
-    if (!(full.startsWith(this.workDir + sep) || full === this.workDir)) {
-      return [false, `路径越权: ${userPath}`];
-    }
-    const ext = path.extname(full).toLowerCase();
-    if (PolicyEngine.FORBIDDEN_EXTS.has(ext)) return [false, `禁止写入 ${ext}`];
-    return [true, full];
-  }
-
-  /** yolo 模式：跳过路径越权检查，但仍检查危险文件扩展名。 */
-  private auditPathWriteYolo(args: Record<string, unknown>): [boolean, string] {
     const userPath = String(args["path"] || args["filePath"] || args["source"] || "");
     const full = path.resolve(this.workDir, userPath);
     const ext = path.extname(full).toLowerCase();

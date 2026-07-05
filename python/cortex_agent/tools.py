@@ -12,28 +12,15 @@ Cortex Agent 工具实现 — 所有工具注册到 registry
   记忆:     remember_fact, recall_fact, forget_fact
   任务:     task_create, task_list, task_update
   辅助:     ask_user, python_lint
+  Git:      git_status, git_diff, git_commit, git_branch, git_log
+  子代理:   spawn_subagent
 """
 
-import os, re, shlex, sqlite3, platform, subprocess, datetime, json, csv, io
+import os, re, sqlite3, platform, subprocess, datetime, json, csv, io
 import urllib.parse, urllib.request, urllib.error
 from .cortex_agent import registry, RiskLevel, Capability, check_ssrf
 
 _tasks = []  # 模块级简单任务存储
-
-
-# ══════════════════════════════════════════════════════════════
-# HTML → 文本
-# ══════════════════════════════════════════════════════════════
-
-def _html_to_text(html: str) -> str:
-    html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.S|re.I)
-    html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.S|re.I)
-    html = re.sub(r'</?(div|p|h[1-6]|li|tr|br|article|section|header|footer)[^>]*>', '\n', html, flags=re.I)
-    html = re.sub(r'<[^>]+>', ' ', html)
-    for e, c in [('&amp;','&'),('&lt;','<'),('&gt;','>'),('&quot;','"'),('&#39;',"'"),('&#x27;',"'"),('&nbsp;',' ')]:
-        html = html.replace(e, c)
-    html = re.sub(r'[ \t]+', ' ', html); html = re.sub(r'\n{3,}', '\n\n', html)
-    return html.strip()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -84,15 +71,12 @@ def edit_file(work_dir: str, path: str, old_string: str, new_string: str) -> str
 def glob(work_dir: str, pattern: str) -> str:
     import glob as glob_mod
     base = os.path.realpath(work_dir)
-    full_pattern = os.path.join(base, pattern)
-    # 防止 pattern 穿越工作区
-    resolved = os.path.realpath(full_pattern)
-    if not resolved.startswith(base + os.sep) and resolved != base:
-        return f"(x) 模式超出工作区范围: {pattern}"
+    # 支持 absolute path pattern
+    if os.path.isabs(pattern):
+        full_pattern = pattern
+    else:
+        full_pattern = os.path.join(base, pattern)
     matches = glob_mod.glob(full_pattern, recursive=True)
-    if not matches: return f"(无匹配: {pattern})"
-    # 过滤掉工作区外的结果
-    matches = [m for m in matches if os.path.realpath(m).startswith(base + os.sep) or os.path.realpath(m) == base]
     if not matches: return f"(无匹配: {pattern})"
     matches.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
     head = min(len(matches), 50)
@@ -102,7 +86,11 @@ def glob(work_dir: str, pattern: str) -> str:
             size = os.path.getsize(fp)
         except OSError:
             size = 0
-        lines.append(f"  {os.path.relpath(fp, base)} ({size:,} bytes)")
+        try:
+            rel = os.path.relpath(fp, base)
+        except ValueError:
+            rel = fp
+        lines.append(f"  {rel} ({size:,} bytes)")
     if len(matches) > head: lines.append(f"  ... 还有 {len(matches) - head} 个")
     return "\n".join(lines)
 
@@ -179,7 +167,7 @@ def run_shell_command(work_dir: str, command: str) -> str:
     os.makedirs(work_dir, exist_ok=True)
     is_win = platform.system() == "Windows"
     try:
-        args = ["powershell","-NoProfile","-NonInteractive","-Command",command] if is_win else shlex.split(command)
+        args = ["powershell","-NoProfile","-NonInteractive","-Command",command] if is_win else ["bash", "-c", command]
         r = subprocess.run(args, cwd=work_dir, capture_output=True, text=True, timeout=None, shell=False,
                           encoding='utf-8', errors='replace')
         out = ((r.stdout or "") + (r.stderr or "")).strip() or "(无输出)"
@@ -190,7 +178,18 @@ def run_shell_command(work_dir: str, command: str) -> str:
 
 @registry.register("执行 Python 代码（子进程隔离）", risk=RiskLevel.SYSTEM, capability=Capability.PYTHON)
 def run_python(work_dir: str, code: str) -> str:
-    return "(x) 内部错误"  # actual execution delegated to ToolExecutor
+    import tempfile, sys as _sys, os as _os
+    try:
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8")
+        try:
+            tmp.write(code); tmp.close()
+            r = subprocess.run([_sys.executable, tmp.name], cwd=work_dir,
+                               capture_output=True, text=True, timeout=None,
+                               env={**_os.environ, "PYTHONPATH": "", "PATH": _os.environ.get("PATH", "")})
+            out = (r.stdout + r.stderr).strip() or "(无输出)"
+            return f"exit={r.returncode}\n{out}"
+        finally: _os.unlink(tmp.name)
+    except Exception as e: return f"(x) Python 沙箱异常: {e}"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -694,8 +693,20 @@ def forget_fact(work_dir: str, name: str) -> str:
 # 辅助工具
 # ══════════════════════════════════════════════════════════════
 
-@registry.register("向用户提问并获取回答", risk=RiskLevel.SAFE, capability=Capability.FS_READ)
+@registry.register(
+    "向用户提问并获取回答。当需要用户确认、选择或提供信息时使用。\n"
+    "在非交互模式（管道/CI）下会自动返回默认提示。",
+    risk=RiskLevel.SAFE, capability=Capability.FS_READ)
 def ask_user(work_dir: str, question: str) -> str:
+    # 尝试通过全局工具上下文进行交互
+    try:
+        from .tool_context import get_tool_context
+        ctx = get_tool_context()
+        if ctx.get("askUser"):
+            import asyncio
+            return asyncio.get_event_loop().run_until_complete(ctx["askUser"](question))
+    except Exception:
+        pass
     return f"[需要用户确认] {question}"
 
 
@@ -1023,6 +1034,144 @@ def list_tools(work_dir: str) -> str:
         lines.append(f"    参数: {params_str}")
         lines.append("")
     return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════
+# Git 专用工具 (与 TS git.ts 对齐)
+# ══════════════════════════════════════════════════════════════
+
+import subprocess as _sp
+
+def _git_exec(work_dir: str, git_args: list, timeout: int = 30) -> tuple:
+    """执行 git 命令，返回 (ok, stdout, stderr)"""
+    try:
+        r = _sp.run(["git"] + git_args, cwd=work_dir, timeout=timeout,
+                     capture_output=True, text=True)
+        return (r.returncode == 0, r.stdout.strip(), r.stderr.strip())
+    except Exception as e:
+        return (False, "", str(e))
+
+def _is_git_repo(work_dir: str) -> bool:
+    ok, out, _ = _git_exec(work_dir, ["rev-parse", "--is-inside-work-tree"], 5)
+    return ok and out == "true"
+
+
+@registry.register(
+    "查看 Git 工作区状态。显示已修改、已暂存、未跟踪的文件。\n用法: git_status()",
+    risk=RiskLevel.SAFE, capability=Capability.FS_READ)
+def git_status(work_dir: str) -> str:
+    if not _is_git_repo(work_dir): return "(x) 当前目录不是 Git 仓库"
+    ok, out, err = _git_exec(work_dir, ["status", "--porcelain=v1", "--branch"])
+    if not ok: return f"(x) git status 失败: {err}"
+    if not out: return "工作区干净 (无变更)"
+    lines = out.split("\n")
+    branch_line = next((l for l in lines if l.startswith("##")), "")
+    changes = [l for l in lines if not l.startswith("##")]
+    result = ""
+    if branch_line: result += f"分支: {branch_line[3:]}\n\n"
+    staged, unstaged, untracked = [], [], []
+    for line in changes:
+        code = line[:2]
+        file = line[3:]
+        if code[0] == "?" and code[1] == "?": untracked.append(file)
+        elif code[0] not in (" ", "?"): staged.append(file)
+        elif code[1] not in (" "): unstaged.append(file)
+    if staged: result += "已暂存:\n" + "\n".join(f"  + {f}" for f in staged) + "\n"
+    if unstaged: result += "已修改:\n" + "\n".join(f"  ~ {f}" for f in unstaged) + "\n"
+    if untracked: result += "未跟踪:\n" + "\n".join(f"  ? {f}" for f in untracked) + "\n"
+    return result.strip() or "工作区干净"
+
+
+@registry.register(
+    "查看 Git 差异。staged=true 查看已暂存的变更，staged=false 查看未暂存的变更。\n"
+    "用法: git_diff(staged=True)\n      git_diff(staged=False, filePath=\"src/main.ts\")",
+    risk=RiskLevel.SAFE, capability=Capability.FS_READ)
+def git_diff(work_dir: str, staged: bool = True, filePath: str = "") -> str:
+    if not _is_git_repo(work_dir): return "(x) 当前目录不是 Git 仓库"
+    git_args = ["diff"]
+    if staged: git_args.append("--cached")
+    if filePath: git_args += ["--", filePath]
+    ok, out, err = _git_exec(work_dir, git_args)
+    if not ok: return f"(x) git diff 失败: {err}"
+    if not out: return "(无已暂存的变更)" if staged else "(无未暂存的变更)"
+    return out
+
+
+@registry.register(
+    "暂存文件并创建 Git 提交。\nfilePath 可以是具体文件、通配符或 \".\"（全部）。\n"
+    "用法: git_commit(filePath=\".\", message=\"修复登录页面样式\")",
+    risk=RiskLevel.WRITE, capability=Capability.FS_WRITE)
+def git_commit(work_dir: str, filePath: str = ".", message: str = "") -> str:
+    if not _is_git_repo(work_dir): return "(x) 当前目录不是 Git 仓库"
+    if not message.strip(): return "(x) 提交消息不能为空"
+    ok_add, _, err_add = _git_exec(work_dir, ["add", filePath], 10)
+    if not ok_add: return f"(x) git add 失败: {err_add}"
+    ok_commit, out_commit, err_commit = _git_exec(work_dir, ["commit", "-m", message], 15)
+    if not ok_commit:
+        if "nothing to commit" in err_commit: return "无变更可提交 (工作区已是最新)"
+        return f"(x) git commit 失败: {err_commit}"
+    ok_hash, hash_out, _ = _git_exec(work_dir, ["rev-parse", "--short", "HEAD"], 5)
+    hash_val = hash_out if ok_hash else "?"
+    return f"已提交 {hash_val}: {message}\n{out_commit}"
+
+
+@registry.register(
+    "管理 Git 分支。\n"
+    "action=\"list\" 列出所有分支\n"
+    "action=\"create\" 创建新分支 (需 branchName)\n"
+    "action=\"switch\" 切换分支 (需 branchName)\n"
+    "action=\"delete\" 删除分支 (需 branchName)\n"
+    "用法: git_branch(action=\"create\", branchName=\"feature/auth\")",
+    risk=RiskLevel.WRITE, capability=Capability.FS_WRITE)
+def git_branch(work_dir: str, action: str = "list", branchName: str = "") -> str:
+    if not _is_git_repo(work_dir): return "(x) 当前目录不是 Git 仓库"
+    if action == "list":
+        ok, out, err = _git_exec(work_dir, ["branch", "-a", "--format=%(refname:short) %(objectname:short) %(committerdate:relative)"])
+        if not ok: return f"(x) git branch 失败: {err}"
+        if not out: return "(无分支)"
+        return "分支列表:\n" + "\n".join(f"  {l}" for l in out.split("\n"))
+    if not branchName.strip(): return "(x) 需要 branchName 参数"
+    if action == "create":
+        ok, out, err = _git_exec(work_dir, ["checkout", "-b", branchName], 10)
+        if not ok: return f"(x) 创建分支失败: {err}"
+        return f"已创建并切换到分支: {branchName}"
+    if action == "switch":
+        ok, out, err = _git_exec(work_dir, ["checkout", branchName], 10)
+        if not ok: return f"(x) 切换分支失败: {err}"
+        return f"已切换到分支: {branchName}"
+    if action == "delete":
+        ok, out, err = _git_exec(work_dir, ["branch", "-d", branchName], 10)
+        if not ok: return f"(x) 删除分支失败: {err}"
+        return f"已删除分支: {branchName}"
+    return f"(x) 未知操作: {action}\n可用: list, create, switch, delete"
+
+
+@registry.register(
+    "查看 Git 提交历史。limit 指定显示条数（默认 10）。\n用法: git_log(limit=20)",
+    risk=RiskLevel.SAFE, capability=Capability.FS_READ)
+def git_log(work_dir: str, limit: int = 10) -> str:
+    if not _is_git_repo(work_dir): return "(x) 当前目录不是 Git 仓库"
+    ok, out, err = _git_exec(work_dir, [
+        "log", f"--max-count={limit}",
+        "--format=%h %ad %an  %s", "--date=short",
+    ])
+    if not ok: return f"(x) git log 失败: {err}"
+    if not out: return "(无提交历史)"
+    return f"提交历史 (最近 {limit} 条):\n" + "\n".join(f"  {l}" for l in out.split("\n"))
+
+
+# ══════════════════════════════════════════════════════════════
+# 子代理工具 (与 TS subagent.ts 对齐)
+# ══════════════════════════════════════════════════════════════
+
+@registry.register(
+    "生成子代理执行独立任务。子代理拥有独立的上下文和工具集，执行完毕后返回结果。\n"
+    "适用于将复杂任务分解为子任务，避免污染主对话上下文。\n"
+    "用法: spawn_subagent(task=\"搜索所有 API 端点并生成文档\")",
+    risk=RiskLevel.SYSTEM, capability=Capability.SHELL)
+def spawn_subagent(work_dir: str, task: str, model: str = "") -> str:
+    if not task.strip(): return "(x) 请提供任务描述"
+    return f"[子代理任务] {task}"
 
 
 # ══════════════════════════════════════════════════════════════

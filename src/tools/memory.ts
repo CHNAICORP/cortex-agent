@@ -3,8 +3,10 @@
  */
 import * as fs from "fs";
 import * as path from "path";
+import { spawnSync } from "child_process";
 import { registry } from '../core/registry.js';
 import { RiskLevel, Capability } from '../core/types.js';
+import { getToolContext } from '../core/tool_context.js';
 
 function getMemoryPath(workDir: string): string {
   return path.join(workDir, "memory.md");
@@ -62,25 +64,62 @@ registry.register("删除记忆", RiskLevel.SAFE, Capability.FS_WRITE,
   },
 );
 
-registry.register("向用户提问", RiskLevel.SAFE, Capability.FS_READ,
+registry.register(
+  "向用户提问并获取回答。当需要用户确认、选择或提供信息时使用。\n"
+  + "在非交互模式（管道/CI）下会自动返回默认提示。",
+  RiskLevel.SAFE, Capability.FS_READ,
   { workDir: "string", question: "string" },
-  function ask_user(_wd: string, args: Record<string, unknown>): string {
-    return `[需要用户确认] ${args["question"]}`;
+  async function ask_user(_wd: string, args: Record<string, unknown>): Promise<string> {
+    const question = String(args["question"] || "");
+    const ctx = getToolContext();
+    if (ctx.askUser) {
+      return await ctx.askUser(question);
+    }
+    // fallback: 没有设置交互回调
+    return `[需要用户确认] ${question}`;
   },
 );
 
-registry.register("Python 语法检查", RiskLevel.SAFE, Capability.FS_READ,
+registry.register(
+  "用 Python AST 检查 Python 代码语法错误。支持文件路径或直接传入代码。",
+  RiskLevel.SAFE, Capability.FS_READ,
   { workDir: "string", filePath: "string", code: "string" },
   function python_lint(workDir: string, args: Record<string, unknown>): string {
     const fp = String(args["filePath"] || "");
     const code = String(args["code"] || "");
-    // Simplified lint — check for obvious syntax issues
-    if (code) return "OK — 语法检查通过 (简版)";
-    if (fp) {
+    let source = "";
+    if (code) {
+      source = code;
+    } else if (fp) {
       const d = path.resolve(path.isAbsolute(fp) ? fp : path.join(workDir, fp));
       if (!fs.existsSync(d)) return `(x) 文件不存在: ${fp}`;
-      return "OK — 语法检查通过 (简版)";
+      try {
+        source = fs.readFileSync(d, "utf-8");
+      } catch (e) {
+        return `(x) 读取文件失败: ${e}`;
+      }
+    } else {
+      return "(x) 需要 filePath 或 code 参数";
     }
-    return "(x) 需要 filePath 或 code 参数";
+    // 使用 Python AST 进行语法检查（与 Python 端对齐）
+    try {
+      const result = spawnSync(
+        "python", ["-c", "import ast, sys; ast.parse(sys.stdin.read())"],
+        { input: source, timeout: 10000, encoding: "utf-8" }
+      );
+      if (result.status === 0) {
+        return "OK — 语法检查通过";
+      }
+      const stderr = (result.stderr || "").trim();
+      // 提取语法错误信息
+      const m = stderr.match(/line (\d+).*?(?:SyntaxError:\s*(.*))/s);
+      if (m) {
+        return `语法错误 第${m[1]}行: ${m[2] || stderr.slice(0, 200)}`;
+      }
+      return `语法错误: ${stderr.slice(0, 300)}`;
+    } catch (e) {
+      // Python 不可用时使用简版检查
+      return `(x) Python 不可用: ${e}`;
+    }
   },
 );

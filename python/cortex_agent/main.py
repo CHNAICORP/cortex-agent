@@ -173,11 +173,14 @@ def main():
     p.add_argument("--max-rounds", type=int, default=None, help="限制续行轮数（0=无限）")
     p.add_argument("--no-stream", action="store_true", help="关闭流式输出")
     p.add_argument("--query","-q", default=None, help="单次查询")
+    p.add_argument("-p", "--pipe", default=None, metavar="PROMPT", help="管道模式 (从 stdin 读取输入，非交互)")
     p.add_argument("--resume", default=None, metavar="SESSION_ID", help="恢复到指定会话的完整上下文")
     p.add_argument("--list-sessions", action="store_true", help="列出已保存的会话")
     p.add_argument("--init-config", action="store_true", help="创建默认 .cortex/settings.json")
     p.add_argument("--mode", default=None, choices=["standard","auto","yolo"],
                    help="权限模式: standard|auto|yolo")
+    p.add_argument("--allowed-tools", default=None, help="工具白名单 (逗号分隔)")
+    p.add_argument("--disallowed-tools", default=None, help="工具黑名单 (逗号分隔)")
     args = p.parse_args()
 
     if args.version:
@@ -222,6 +225,21 @@ def main():
         agent.config.permission_mode = args.mode
     wd = agent.work_dir
 
+    # ── 加载 Hooks 配置 ──
+    agent.hooks.load_from_config(settings)
+    if agent.hooks.count > 0:
+        print(f"[cortex] {agent.hooks.count} hooks loaded", file=sys.stderr)
+
+    # ── 工具白名单/黑名单 ──
+    if args.allowed_tools:
+        allowed = [t.strip() for t in args.allowed_tools.split(",") if t.strip()]
+        agent.set_tool_filter(allowed=allowed)
+        print(f"[cortex] 工具白名单: {', '.join(allowed)}", file=sys.stderr)
+    if args.disallowed_tools:
+        disallowed = [t.strip() for t in args.disallowed_tools.split(",") if t.strip()]
+        agent.set_tool_filter(disallowed=disallowed)
+        print(f"[cortex] 工具黑名单: {', '.join(disallowed)}", file=sys.stderr)
+
     # ── Session initialization ──
     if args.list_sessions:
         if agent.sessions:
@@ -258,6 +276,34 @@ def main():
                     context_limit=agent.context_limit, is_resume=bool(args.resume))
 
     # ── Skills 系统通过 agent.skill_mgr 访问 ──
+    # ── 管道模式 (-p) ──
+    is_pipe = args.pipe is not None or (not sys.stdin.isatty() and not args.query)
+    if is_pipe:
+        agent.set_non_interactive(True)
+        pipe_prompt = args.pipe or ""
+        stdin_data = ""
+        if not sys.stdin.isatty():
+            try:
+                stdin_data = sys.stdin.read()
+            except Exception:
+                pass
+        if pipe_prompt and stdin_data.strip():
+            combined_query = f"{pipe_prompt}\n\n--- stdin 内容 ---\n{stdin_data.strip()}"
+        elif pipe_prompt:
+            combined_query = pipe_prompt
+        elif stdin_data.strip():
+            combined_query = stdin_data.strip()
+        else:
+            print('[cortex] 管道模式需要提供输入 (-p "prompt" 或 stdin)', file=sys.stderr)
+            return
+        ans = agent.run(combined_query)
+        if args.no_stream: print(ans)
+        t = agent.last_trace()
+        if t and t.steps: print(f"\n[审计] {len(t.steps)} 步, {sum(s.latency_ms for s in t.steps):.0f}ms", file=sys.stderr)
+        if agent.session_id:
+            print(f"[会话] {agent.session_id}", file=sys.stderr)
+        return
+
     if args.query:
         ans = agent.run(args.query)
         if args.no_stream: print(ans)

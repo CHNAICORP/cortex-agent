@@ -13,7 +13,7 @@ from typing import List
 
 
 class Terminal:
-    """终端流式显示：thinking deep-grey, answer bright, long-thinking fold"""
+    """终端流式显示：thinking deep-grey, answer bright, long-thinking fold, code typewriter"""
 
     DEEP  = "\033[38;5;239m"
     CYAN  = "\033[38;5;51m"
@@ -30,6 +30,29 @@ class Terminal:
     FOLD_LINE_THRESHOLD = 3
     FOLD_PREVIEW_LEN    = 80
 
+    # ── 代码写入流式显示配置 ──
+    CODE_SMALL_LINE_DELAY = 0.005   # 小文件 (≤50行): 每行 5ms
+    CODE_SMALL_THRESHOLD  = 50
+    CODE_MEDIUM_LINE_DELAY = 0.002  # 中文件 (≤200行): 每行 2ms
+    CODE_MEDIUM_THRESHOLD  = 200
+    CODE_LARGE_LINE_DELAY  = 0.001  # 大文件 (>200行): 每行 1ms
+    CODE_LARGE_HEAD_LINES  = 30
+    CODE_LARGE_TAIL_LINES  = 10
+    CODE_MIN_LENGTH        = 30     # 极短内容不流式
+
+    # 代码颜色映射
+    _CODE_COLORS = {
+        "ts": "\033[38;5;75m", "tsx": "\033[38;5;75m",
+        "js": "\033[38;5;221m", "jsx": "\033[38;5;221m",
+        "py": "\033[38;5;114m",
+        "html": "\033[38;5;209m", "css": "\033[38;5;141m",
+        "json": "\033[38;5;215m", "md": "\033[38;5;250m",
+        "yml": "\033[38;5;215m", "yaml": "\033[38;5;215m",
+        "sql": "\033[38;5;117m", "sh": "\033[38;5;114m",
+        "go": "\033[38;5;81m", "rs": "\033[38;5;173m",
+        "vue": "\033[38;5;114m",
+    }
+
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
         self._buf: List[str] = []          # reasoning token buffer
@@ -37,6 +60,7 @@ class Terminal:
         self._showing_answer = False        # first answer token emitted this round
         self._round = 0                     # current round (increment per _loop)
         self._step = 0                      # current step within round (increment per _think)
+        self._code_stream_enabled = True    # 代码写入打字机效果开关
 
     def _w(self, s: str):
         if self.enabled:
@@ -190,6 +214,65 @@ class Terminal:
 
     def error(self, msg: str):
         self._w(f"\n  {self.RED}✗ {msg}{self.RESET}\n")
+
+    # ── 代码写入打字机效果 ──
+
+    def set_code_stream(self, enabled: bool):
+        """启用/禁用代码流式显示"""
+        self._code_stream_enabled = enabled
+
+    def code_stream(self, file_path: str, content: str):
+        """流式显示代码写入过程 — 打字机效果。
+        
+        策略:
+          - 小文件 (≤50行): 全部显示，每行 5ms 延迟
+          - 中文件 (≤200行): 全部显示，每行 2ms 延迟
+          - 大文件 (>200行): 首尾显示 + 中间省略，每行 1ms 延迟
+          - 极短内容 (<30字符): 不流式，直接跳过
+        """
+        import time, os
+        if not self._code_stream_enabled or not content or len(content) < self.CODE_MIN_LENGTH:
+            return
+
+        file_name = os.path.basename(file_path) or file_path
+        ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+        lines = content.split("\n")
+        total_lines = len(lines)
+        total_chars = len(content)
+        code_color = self._CODE_COLORS.get(ext, self.DIM)
+
+        # 头部
+        border_len = min(len(file_name) + 20, 60)
+        self._w(f"\n  {self.DIM}✎ {self.RESET}{self.CYAN}{file_name}{self.RESET} {self.GRAY}({total_lines} 行, {total_chars:,} 字符){self.RESET}\n")
+        self._w(f"  {self.GRAY}┌{'─' * border_len}┐{self.RESET}\n")
+
+        # 决定显示策略
+        if total_lines <= self.CODE_SMALL_THRESHOLD:
+            display_lines = lines
+            line_delay = self.CODE_SMALL_LINE_DELAY
+        elif total_lines <= self.CODE_MEDIUM_THRESHOLD:
+            display_lines = lines
+            line_delay = self.CODE_MEDIUM_LINE_DELAY
+        else:
+            head = lines[:self.CODE_LARGE_HEAD_LINES]
+            tail = lines[-self.CODE_LARGE_TAIL_LINES:]
+            omitted = total_lines - self.CODE_LARGE_HEAD_LINES - self.CODE_LARGE_TAIL_LINES
+            display_lines = head + [f"__OMITTED__{omitted}__"] + tail
+            line_delay = self.CODE_LARGE_LINE_DELAY
+
+        # 流式输出
+        for line in display_lines:
+            if line.startswith("__OMITTED__"):
+                count = int(line.replace("__OMITTED__", "").replace("__", ""))
+                self._w(f"  {self.GRAY}│  ... 省略 {count} 行 ...{self.RESET}\n")
+            else:
+                display_line = line[:117] + "..." if len(line) > 120 else line
+                self._w(f"  {self.GRAY}│{self.RESET} {code_color}{display_line}{self.RESET}\n")
+            if line_delay > 0:
+                time.sleep(line_delay)
+
+        # 底部
+        self._w(f"  {self.GRAY}└{'─' * border_len}┘{self.RESET}\n")
 
 
 def _fmt_args(args: dict) -> str:

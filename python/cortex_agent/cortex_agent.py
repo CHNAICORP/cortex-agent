@@ -39,6 +39,8 @@ from enum import Enum
 import httpx
 from openai import OpenAI
 
+from .hooks import HookContext
+
 
 # ══════════════════════════════════════════════════════════════
 # 核心类型
@@ -194,9 +196,6 @@ class ToolExecutor:
     def execute(self, name: str, args: dict) -> str:
         fn = self.reg.get(name)
         if not fn: return f"(x) 未知工具: {name}"
-        meta = self.reg.meta(name)
-        if meta and meta["capability"] == Capability.PYTHON:
-            return self._exec_python_isolated(args.get("code", ""))
         try:
             clean = {k: v for k, v in args.items() if k != "work_dir"}
             result = fn(self.work_dir, **clean)
@@ -214,23 +213,6 @@ class ToolExecutor:
         tail = limit // 3
         omitted = len(result) - head - tail
         return f"{result[:head]}\n\n[...已截断，省略 {omitted} 字符...]\n\n{result[-tail:]}"
-
-    def _exec_python_isolated(self, code: str) -> str:
-        import tempfile, subprocess, sys as _sys, os as _os
-        # tool_timeout=0 → None（无超时，支持长时间运行）
-        py_timeout = self.timeout if self.timeout and self.timeout > 0 else None
-        try:
-            tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8")
-            try:
-                tmp.write(code); tmp.close()
-                r = subprocess.run([_sys.executable, tmp.name], cwd=self.work_dir,
-                                   capture_output=True, text=True, timeout=py_timeout,
-                                   env={**_os.environ, "PYTHONPATH": "", "PATH": _os.environ.get("PATH", "")})
-                out = (r.stdout + r.stderr).strip() or "(无输出)"
-                return f"exit={r.returncode}\n{out}"
-            finally: _os.unlink(tmp.name)
-        except subprocess.TimeoutExpired: return f"(x) Python 超时 (>{py_timeout}s)"
-        except Exception as e: return f"(x) Python 沙箱异常: {e}"
 
 # ══════════════════════════════════════════════════════════════
 
@@ -278,10 +260,11 @@ DEFAULT_SYSTEM = (
     "  最终回答应该总结你完成的工作和关键结果。\n\n"
     "== 安全边界 ==\n"
     "1. 不得执行可能危害系统安全、泄露数据或破坏系统完整性的操作。\n"
-    "2. 文件操作限于工作目录，不得修改系统配置或系统服务。\n"
+    "2. 不得修改系统配置或系统服务文件（如 C:\\Windows, /etc 等）。\n"
     "3. 不得将文件内容通过外部网络发送。\n"
     "4. 不得读取系统敏感文件（如 /etc/passwd、~/.ssh、SAM、注册表）。\n"
-    "5. 不得使用编码命令或混淆方式执行 shell。\n\n"
+    "5. 不得使用编码命令或混淆方式执行 shell。\n"
+    "6. 文件操作可以在用户目录范围内自由进行（桌面、文档、工作目录等）。\n\n"
     "== 企业级大项目工程指引 ==\n"
     "你具备连续长时间工作的能力，可以完成 10 万行以上代码的大型项目。遵循以下原则：\n"
     "1. **任务分解**：复杂任务先用 write_file 创建 TASKS.md，分解为里程碑和子任务。\n"
@@ -747,6 +730,16 @@ class CortexAgent:
         self._label_done = False
         # ── Permission decision memory (session-scoped) ──
         self._permission_decisions: Dict[str, bool] = {}
+        # ── Hooks system ──
+        from .hooks import HookManager, HookContext
+        self._hooks = HookManager()
+        # ── Tool whitelist/blacklist ──
+        self._allowed_tools: Optional[set] = None
+        self._disallowed_tools: Optional[set] = None
+        # ── Non-interactive mode (pipe/CI) ──
+        self._non_interactive: bool = False
+        # ── Setup tool context ──
+        self._setup_tool_context()
 
     def _make_governor(self, summary_sid: str = None) -> ContextGovernor:
         """构建 ContextGovernor，注入知识库+记忆+历史摘要+上下文窗口配置。
@@ -844,14 +837,14 @@ class CortexAgent:
         """运行时切换权限模式。返回新模式的描述。
         
         模式说明（参考 Claude Code / Codex 设计）:
-          standard  — 默认模式，SAFE 工具自动放行，WRITE 工作区内放行，SYSTEM 需确认
+          standard  — 默认模式，文件操作全路径放行，SYSTEM 工作区内放行
           auto — 自动批准文件编辑，SYSTEM 自动放行
-          yolo      — 全部放行（含路径穿越），CI/CD 场景
+          yolo      — 全部放行，CI/CD 场景
         """
         mode = mode.lower().strip()
         if mode in ("s", "std", "standard"):
             self.config.permission_mode = "standard"
-            return "standard — SAFE自动 / WRITE区内 / SYSTEM需确认"
+            return "standard — 文件操作全路径放行 / SYSTEM区内放行"
         elif mode in ("a", "auto", "auto-edit", "edit"):
             self.config.permission_mode = "auto"
             return "auto — 自动批准编辑 + SYSTEM放行"
@@ -1067,6 +1060,62 @@ class CortexAgent:
         self._trace = None
         self._last_reasoning = None
 
+    def _setup_tool_context(self):
+        """设置工具上下文（供 ask_user, spawn_subagent 等工具使用）"""
+        from .tool_context import set_tool_context
+        import threading
+
+        def ask_user_handler(question: str) -> str:
+            if self._non_interactive or not self._term:
+                return f"[非交互模式] {question}"
+            self._term._end_reasoning()
+            print(f"\n  {self._term.CYAN}💬 Agent 提问:{self._term.RESET} {question}")
+            try:
+                print(f"  {self._term.GRAY}> {self._term.RESET}", end="", flush=True)
+                ans = input()
+                return ans.strip() or "(用户未输入)"
+            except Exception:
+                return "(用户未响应)"
+
+        def spawn_subagent_handler(task: str, model: str = "") -> str:
+            sub_config = AgentConfig(
+                api_key=self.config.api_key,
+                base_url=self.config.base_url,
+                model=model or self.config.model,
+                work_dir=self.config.work_dir,
+                max_steps=20,
+                max_rounds=1,
+            )
+            sub_agent = CortexAgent(sub_config)
+            sub_agent._non_interactive = True
+            sub_agent._hooks = self._hooks
+            sub_agent._allowed_tools = self._allowed_tools
+            sub_agent._disallowed_tools = self._disallowed_tools
+            sub_agent._setup_tool_context()
+            return sub_agent.run(task)
+
+        set_tool_context({
+            "workDir": self.config.work_dir,
+            "nonInteractive": self._non_interactive,
+            "askUser": ask_user_handler,
+            "spawnSubagent": spawn_subagent_handler,
+        })
+
+    def set_non_interactive(self, v: bool):
+        """设置非交互模式（管道/CI）"""
+        self._non_interactive = v
+        self._setup_tool_context()
+
+    def set_tool_filter(self, allowed: list = None, disallowed: list = None):
+        """设置工具白名单/黑名单"""
+        self._allowed_tools = set(allowed) if allowed else None
+        self._disallowed_tools = set(disallowed) if disallowed else None
+
+    @property
+    def hooks(self):
+        """获取 HookManager"""
+        return self._hooks
+
     def _request_confirmation(self, tool_name: str, args: dict, capability: str) -> bool:
         """向用户请求工具执行授权。返回 True=允许, False=拒绝。"""
         # 使用完整参数生成缓存 key（排除 work_dir）
@@ -1183,8 +1232,12 @@ class CortexAgent:
                 cap = meta["capability"] if meta else None
                 if self._term:
                     self._term.tool_start(name, args)
-                # ── Guard: capability suspension check ──
-                if cap and cap in self._suspended_capabilities:
+                # ── 工具白名单/黑名单过滤 ──
+                if self._allowed_tools and name not in self._allowed_tools:
+                    ok, reason = False, f"工具 {name} 不在白名单中"
+                elif self._disallowed_tools and name in self._disallowed_tools:
+                    ok, reason = False, f"工具 {name} 已被黑名单禁止"
+                elif cap and cap in self._suspended_capabilities:
                     ok, reason = False, f"能力 {cap.value} 已被暂停"
                 else:
                     ok, reason = self.policy.audit(name, args)
@@ -1210,12 +1263,48 @@ class CortexAgent:
                     else:
                         result = f"(x) [Policy 拦截] {reason}"
                 elif reason.startswith(PolicyEngine.WARN_PREFIX):
-                    # WARN tier: execute but annotate
-                    warn_msg = reason[len(PolicyEngine.WARN_PREFIX):]
-                    result = self.executor.execute(name, args)
-                    result = f"[注意: {warn_msg}]\n{result}"
+                    # ── PreToolUse 钩子 ──
+                    pre_hook = self._hooks.run_pre_tool_use(
+                        HookContext(name, args, self.config.work_dir))
+                    if pre_hook.block:
+                        ok = False
+                        result = pre_hook.message
+                    else:
+                        # ── 代码写入打字机效果：在 write_file/edit_file 执行前流式显示代码 ──
+                        if self._term and name in ("write_file", "edit_file"):
+                            content = args.get("content") or args.get("newString") or args.get("new_string") or ""
+                            file_path = args.get("path") or args.get("filePath") or args.get("file_path") or ""
+                            if content and len(content) >= 30:
+                                self._term.code_stream(file_path, content)
+                        # WARN tier: execute but annotate
+                        warn_msg = reason[len(PolicyEngine.WARN_PREFIX):]
+                        result = self.executor.execute(name, args)
+                        result = f"[注意: {warn_msg}]\n{result}"
+                        # ── PostToolUse 钩子 ──
+                        post_hook = self._hooks.run_post_tool_use(
+                            HookContext(name, args, self.config.work_dir, result))
+                        if pre_hook.append: result += f"\n{pre_hook.append}"
+                        if post_hook.append: result += f"\n{post_hook.append}"
                 else:
-                    result = self.executor.execute(name, args)
+                    # ── PreToolUse 钩子 ──
+                    pre_hook = self._hooks.run_pre_tool_use(
+                        HookContext(name, args, self.config.work_dir))
+                    if pre_hook.block:
+                        ok = False
+                        result = pre_hook.message
+                    else:
+                        # ── 代码写入打字机效果：在 write_file/edit_file 执行前流式显示代码 ──
+                        if self._term and name in ("write_file", "edit_file"):
+                            content = args.get("content") or args.get("newString") or args.get("new_string") or ""
+                            file_path = args.get("path") or args.get("filePath") or args.get("file_path") or ""
+                            if content and len(content) >= 30:
+                                self._term.code_stream(file_path, content)
+                        result = self.executor.execute(name, args)
+                        # ── PostToolUse 钩子 ──
+                        post_hook = self._hooks.run_post_tool_use(
+                            HookContext(name, args, self.config.work_dir, result))
+                        if pre_hook.append: result += f"\n{pre_hook.append}"
+                        if post_hook.append: result += f"\n{post_hook.append}"
                 latency = (time.time() - t0) * 1000
                 self.observer.record(trace, step_no, name, args, result, ok, cap_str, latency)
                 if self._term:
