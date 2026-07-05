@@ -94,6 +94,20 @@ export class Terminal {
     }
   }
 
+  /** Check if answer text has been displayed to the user */
+  isAnswerShown(): boolean {
+    return this.showingAnswer;
+  }
+
+  /** Explicitly write answer text to terminal (fallback when streaming didn't work) */
+  writeAnswer(text: string) {
+    if (!this.showingAnswer) {
+      this.closeThinking();
+      this.showingAnswer = true;
+    }
+    this.write(text);
+  }
+
   closeThinking() {
     if (this.shownReasoning && !this.showingAnswer) {
       const reasoning = this.buf.join("");

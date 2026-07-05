@@ -503,6 +503,8 @@ export class CortexAgent {
     nextRound: () => void;
     write: (s: string) => void;
     codeStream: (filePath: string, content: string) => Promise<void>;
+    isAnswerShown: () => boolean;
+    writeAnswer: (text: string) => void;
   } | null = null;
 
   setTerm(t: typeof this.term) { this.term = t; }
@@ -1058,6 +1060,13 @@ this._skillMgr = new SkillManager(this.config.workDir);
       if (!toolCalls) {
         this.ctx.push({ role: "assistant", content: text || "" });
         this.trace.finalAnswer = text || "";
+        // Fallback: if text was returned by LLM but not streamed to terminal
+        // (e.g., API returned content without streaming, or retry levels
+        // produced text but answerToken was never called), print it now.
+        if (this.term && text && !this.term.isAnswerShown()) {
+          this.term.writeAnswer(text);
+          this.term.write("\n");
+        }
         return this.term ? "" : (text || "");
       }
       this.ctx.push({
@@ -1285,11 +1294,13 @@ this._skillMgr = new SkillManager(this.config.workDir);
     };
 
     // ── Level 1: 正常推理模式（含瞬态错误重试） ──
+    let l1Reasoning = "";
     try {
       const { text, toolCalls, reasoning } = await doCallWithRetry(true);
       if (text || toolCalls) {
         return { text, toolCalls, reasoning };
       }
+      l1Reasoning = reasoning || "";
     } catch (e: any) { this.lastLlmError = `[L1] ${e?.message || e}`; /* fall through */ }
 
     // ── Level 2: 关闭推理模式（解决 finishReason=length） ──
@@ -1329,6 +1340,14 @@ this._skillMgr = new SkillManager(this.config.workDir);
 
     if (l4Text || l4Tcs) {
       return { text: l4Text, toolCalls: l4Tcs, reasoning: l4Reasoning };
+    }
+    // ── Fallback: all levels returned empty text.
+    // If reasoning was collected (e.g., API returned reasoning_content but no content),
+    // use the reasoning as the answer text so the user sees something useful
+    // instead of a cryptic "LLM 调用失败" error.
+    const fallbackReasoning = (l4Reasoning && l4Reasoning.trim()) || (l1Reasoning && l1Reasoning.trim());
+    if (fallbackReasoning) {
+      return { text: fallbackReasoning, toolCalls: null, reasoning: "" };
     }
     return { text: null, toolCalls: null, reasoning: "" };
   }
