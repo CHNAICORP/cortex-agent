@@ -1,15 +1,96 @@
 /**
  * 执行工具 — Shell / Python / SQL / 时间 / 任务
+ * 
+ * 超时策略：空闲超时（Inactivity Timeout）
+ *   - 命令持续产生输出 → 一直等待，不中断
+ *   - 命令 N 秒无任何输出 → 判定卡死，超时中断
+ *   - 硬上限 5 分钟作为安全网
  */
 import * as fs from "fs";
 import * as path from "path";
-import { execSync, spawnSync } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import { registry } from '../core/registry.js';
 import { RiskLevel, Capability } from '../core/types.js';
 
+// ── 超时配置 ──
+const INACTIVITY_TIMEOUT = 30;   // 空闲超时（秒）：无输出超过此时间则判定卡死
+const MAX_TIMEOUT = 300;         // 硬上限（秒）：无论如何最多运行 5 分钟
+
+/**
+ * 使用空闲超时执行子进程（异步）。
+ * 
+ * 与 spawnSync(timeout=N) 的区别：
+ * - spawnSync: 硬超时 — N 秒后无条件杀死，即使命令在持续输出
+ * - 本函数: 空闲超时 — 仅当 N 秒无输出时才杀死；命令持续输出则一直等待
+ *           另有硬上限 MAX_TIMEOUT 作为安全网
+ */
+function runWithInactivityTimeout(
+  cmd: string, cmdArgs: string[], cwd: string
+): Promise<{ retcode: number | null; stdout: string; stderr: string; timeoutReason: string | null }> {
+  return new Promise((resolve) => {
+    const proc = spawn(cmd, cmdArgs, { cwd, stdio: ["pipe", "pipe", "pipe"] });
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let lastActivity = Date.now();
+    const startTime = Date.now();
+    let timeoutReason: string | null = null;
+    let settled = false;
+
+    const inactivityTimer = setInterval(() => {
+      if (settled) return;
+      const idle = (Date.now() - lastActivity) / 1000;
+      const total = (Date.now() - startTime) / 1000;
+      if (idle > INACTIVITY_TIMEOUT) {
+        timeoutReason = "inactivity";
+        proc.kill();
+        clearInterval(inactivityTimer);
+      } else if (total > MAX_TIMEOUT) {
+        timeoutReason = "max";
+        proc.kill();
+        clearInterval(inactivityTimer);
+      }
+    }, 500); // 500ms 轮询
+
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      stdoutChunks.push(chunk);
+      lastActivity = Date.now();
+    });
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      stderrChunks.push(chunk);
+      lastActivity = Date.now();
+    });
+
+    proc.on("close", (code) => {
+      if (!settled) {
+        settled = true;
+        clearInterval(inactivityTimer);
+        resolve({
+          retcode: code,
+          stdout: Buffer.concat(stdoutChunks).toString("utf-8").trim(),
+          stderr: Buffer.concat(stderrChunks).toString("utf-8").trim(),
+          timeoutReason,
+        });
+      }
+    });
+
+    proc.on("error", (err) => {
+      if (!settled) {
+        settled = true;
+        clearInterval(inactivityTimer);
+        resolve({
+          retcode: null,
+          stdout: "",
+          stderr: String(err),
+          timeoutReason: null,
+        });
+      }
+    });
+  });
+}
+
 registry.register("执行系统命令", RiskLevel.SYSTEM, Capability.SHELL,
   { workDir: "string", command: "string" },
-  function run_shell_command(workDir: string, args: Record<string, unknown>): string {
+  async function run_shell_command(workDir: string, args: Record<string, unknown>): Promise<string> {
     const cmd = String(args["command"]);
     // ── 阻塞命令检测 ──
     const blockingPatterns = [
@@ -24,39 +105,50 @@ registry.register("执行系统命令", RiskLevel.SYSTEM, Capability.SHELL,
       }
     }
     const isWin = process.platform === "win32";
-    try {
-      const result = isWin
-        ? spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", cmd],
-            { cwd: workDir, timeout: 30000, encoding: "utf-8" })
-        : spawnSync("bash", ["-c", cmd],
-            { cwd: workDir, timeout: 30000, encoding: "utf-8" });
-      const out = ((result.stdout || "") + (result.stderr || "")).trim() || "(无输出)";
-      if (result.error && (result.error as any).code === "ETIMEDOUT") {
-        return `(x) 超时（命令执行超过 30s）\n命令: ${cmd}\n\n可能的原因:\n  1. 命令是长期运行的进程（如服务器启动）\n  2. 命令陷入了死循环\n  3. 网络问题导致挂起`;
-      }
-      return `exit=${result.status}\n${out}`;
-    } catch (e) { return `(x) ${e}`; }
+    const cmdArgs = isWin
+      ? ["-NoProfile", "-NonInteractive", "-Command", cmd]
+      : ["-c", cmd];
+    const exe = isWin ? "powershell" : "bash";
+
+    const { retcode, stdout, stderr, timeoutReason } = await runWithInactivityTimeout(exe, cmdArgs, workDir);
+
+    if (timeoutReason === "inactivity") {
+      const partial = (stdout + stderr).trim();
+      const partialMsg = partial ? `\n\n已捕获的部分输出:\n${partial.slice(0, 500)}` : "";
+      return `(x) 空闲超时（命令 ${INACTIVITY_TIMEOUT}s 无任何输出，判定为卡死）\n命令: ${cmd}\n${partialMsg}\n\n可能的原因:\n  1. 命令启动了阻塞式进程（如服务器）等待输入\n  2. 命令在等待网络响应\n  3. 命令进入了交互模式`;
+    } else if (timeoutReason === "max") {
+      const partial = (stdout + stderr).trim();
+      const partialMsg = partial ? `\n\n已捕获的部分输出:\n${partial.slice(0, 500)}` : "";
+      return `(x) 硬超时（命令执行超过 ${MAX_TIMEOUT}s 上限）\n命令: ${cmd}${partialMsg}`;
+    }
+
+    const out = (stdout + stderr).trim() || "(无输出)";
+    return `exit=${retcode}\n${out}`;
   },
 );
 
 registry.register("执行 Python 代码", RiskLevel.SYSTEM, Capability.PYTHON,
   { workDir: "string", code: "string" },
-  function run_python(_workDir: string, args: Record<string, unknown>): string {
+  async function run_python(_workDir: string, args: Record<string, unknown>): Promise<string> {
     const code = String(args["code"]);
     try {
-      // Use random suffix to prevent collision when two calls happen in same ms
       const rnd = Math.random().toString(36).slice(2, 8);
       const tmp = path.join(require("os").tmpdir(), `ctx_py_${Date.now()}_${rnd}.py`);
       fs.writeFileSync(tmp, code, "utf-8");
       try {
-        const result = spawnSync("python", [tmp], { timeout: 30000, encoding: "utf-8" });
-        const out = ((result.stdout || "") + (result.stderr || "")).trim().slice(0, 3000) || "(无输出)";
-        if (result.error && (result.error as any).code === "ETIMEDOUT") {
-          return `(x) 超时（Python 代码执行超过 30s）\n\n可能的原因:\n  1. 代码中有无限循环\n  2. 代码长时间等待 I/O\n  3. 代码计算量过大`;
+        const { retcode, stdout, stderr, timeoutReason } = await runWithInactivityTimeout("python", [tmp], _workDir);
+        if (timeoutReason === "inactivity") {
+          const partial = (stdout + stderr).trim();
+          const partialMsg = partial ? `\n\n已捕获的部分输出:\n${partial.slice(0, 500)}` : "";
+          return `(x) 空闲超时（Python 代码 ${INACTIVITY_TIMEOUT}s 无输出，判定为卡死）\n可能的原因:\n  1. 代码中有 input() 等待用户输入\n  2. 代码在等待网络响应\n  3. 代码进入了死循环但不产生输出${partialMsg}`;
+        } else if (timeoutReason === "max") {
+          const partial = (stdout + stderr).trim();
+          const partialMsg = partial ? `\n\n已捕获的部分输出:\n${partial.slice(0, 500)}` : "";
+          return `(x) 硬超时（Python 代码执行超过 ${MAX_TIMEOUT}s 上限）${partialMsg}`;
         }
-        return `exit=${result.status}\n${out}`;
+        const out = (stdout + stderr).trim().slice(0, 3000) || "(无输出)";
+        return `exit=${retcode}\n${out}`;
       } finally {
-        // Always clean up temp file even if spawn fails
         try { fs.unlinkSync(tmp); } catch { /* ignore */ }
       }
     } catch (e) { return `(x) Python 沙箱异常: ${e}`; }
@@ -69,7 +161,6 @@ registry.register("执行只读 SQL 查询", RiskLevel.SAFE, Capability.DB_READ,
     const sql = String(args["sql"]).trim().replace(/;$/, "");
     const dbPath = path.join(workDir, "agent.db");
     if (!fs.existsSync(dbPath)) return "(x) agent.db 不存在";
-    // SQLite via better-sqlite3 would be ideal, but for zero-deps we use node:sqlite (Node 22+)
     try {
       const { DatabaseSync } = require("node:sqlite");
       const db = new DatabaseSync(dbPath);

@@ -23,8 +23,10 @@ from .cortex_agent import registry, RiskLevel, Capability, check_ssrf
 _tasks = []  # 模块级简单任务存储
 
 # ── 工具超时配置（可从 AgentConfig.tool_timeout 设置）──
-_SHELL_TIMEOUT = 30  # 默认 30 秒
-_PYTHON_TIMEOUT = 30  # 默认 30 秒
+_SHELL_TIMEOUT = 30          # 空闲超时（秒）：无输出超过此时间则判定卡死
+_SHELL_MAX_TIMEOUT = 300     # 硬上限（秒）：无论如何最多运行 5 分钟
+_PYTHON_TIMEOUT = 30         # 空闲超时（秒）
+_PYTHON_MAX_TIMEOUT = 300    # 硬上限（秒）
 
 # 阻塞命令模式（会启动长期运行的进程）
 _BLOCKING_COMMAND_PATTERNS = [
@@ -35,11 +37,89 @@ _BLOCKING_COMMAND_PATTERNS = [
 ]
 
 def set_tool_timeout(seconds: int):
-    """设置工具执行超时（秒）。0 表示无超时。"""
+    """设置工具执行空闲超时（秒）。0 表示无超时。
+    
+    注意：这是「空闲超时」而非「硬超时」——
+    只要命令持续产生输出就不会被中断，
+    仅当命令无输出超过此时间才判定为卡死。
+    """
     global _SHELL_TIMEOUT, _PYTHON_TIMEOUT
     if seconds > 0:
         _SHELL_TIMEOUT = seconds
         _PYTHON_TIMEOUT = seconds
+
+
+def _run_with_inactivity_timeout(args, cwd, env=None, inactivity_timeout=30, max_timeout=300):
+    """使用空闲超时执行子进程。
+    
+    与 subprocess.run(timeout=N) 的区别：
+    - subprocess.run: 硬超时 — N 秒后无条件杀死，即使命令在持续输出
+    - 本函数: 空闲超时 — 仅当 N 秒无输出时才杀死；命令持续输出则一直等待
+              另有硬上限 max_timeout 作为安全网
+    
+    返回: (returncode, stdout, stderr, timed_out_reason)
+      timed_out_reason: None=正常结束, "inactivity"=空闲超时, "max"=硬上限超时
+    """
+    import threading
+    
+    proc = subprocess.Popen(
+        args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding='utf-8', errors='replace',
+        env=env,
+    )
+    
+    stdout_lines = []
+    stderr_lines = []
+    last_activity = [time.time()]
+    start_time = time.time()
+    timed_out = [None]  # None | "inactivity" | "max"
+    
+    def read_stream(stream, buf_list):
+        """逐行读取输出，更新最后活动时间"""
+        try:
+            for line in stream:
+                buf_list.append(line)
+                last_activity[0] = time.time()
+        except Exception:
+            pass
+    
+    # 启动两个线程分别读取 stdout 和 stderr
+    t_out = threading.Thread(target=read_stream, args=(proc.stdout, stdout_lines), daemon=True)
+    t_err = threading.Thread(target=read_stream, args=(proc.stderr, stderr_lines), daemon=True)
+    t_out.start()
+    t_err.start()
+    
+    # 主线程：监控超时
+    while True:
+        ret = proc.poll()
+        if ret is not None:
+            # 进程已结束
+            break
+        
+        now = time.time()
+        idle = now - last_activity[0]
+        total = now - start_time
+        
+        if inactivity_timeout > 0 and idle > inactivity_timeout:
+            timed_out[0] = "inactivity"
+            proc.kill()
+            break
+        
+        if max_timeout > 0 and total > max_timeout:
+            timed_out[0] = "max"
+            proc.kill()
+            break
+        
+        time.sleep(0.2)  # 200ms 轮询
+    
+    # 等待读取线程完成
+    t_out.join(timeout=2)
+    t_err.join(timeout=2)
+    proc.wait()
+    
+    stdout = "".join(stdout_lines).strip()
+    stderr = "".join(stderr_lines).strip()
+    return proc.returncode, stdout, stderr, timed_out[0]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -191,18 +271,37 @@ def run_shell_command(work_dir: str, command: str) -> str:
             return f"(x) 检测到阻塞命令: '{command}'\n该命令会启动长期运行的进程（如服务器），无法在工具执行超时内完成。\n\n建议:\n  1. 使用后台运行模式（如 npm start &）\n  2. 使用专门的验证工具检查服务是否正常\n  3. 使用 Ctrl+C 中断当前命令"
     
     is_win = platform.system() == "Windows"
-    try:
-        args = ["powershell","-NoProfile","-NonInteractive","-Command",command] if is_win else ["bash", "-c", command]
-        timeout = _SHELL_TIMEOUT if _SHELL_TIMEOUT > 0 else None
-        r = subprocess.run(args, cwd=work_dir, capture_output=True, text=True, timeout=timeout, shell=False,
-                          encoding='utf-8', errors='replace')
-        out = ((r.stdout or "") + (r.stderr or "")).strip() or "(无输出)"
-        return f"exit={r.returncode}\n{out}"
-    except subprocess.TimeoutExpired:
-        timeout_str = f"{_SHELL_TIMEOUT}s" if _SHELL_TIMEOUT > 0 else "无限制"
-        return f"(x) 超时（命令执行超过 {timeout_str}）\n命令: {command}\n\n可能的原因:\n  1. 命令是长期运行的进程（如服务器启动）\n  2. 命令陷入了死循环\n  3. 网络问题导致挂起\n\n建议:\n  1. 检查命令是否为阻塞式启动命令\n  2. 使用 Ctrl+C 中断后重试"
-    except Exception as e:
-        return f"(x) {e}"
+    args = ["powershell","-NoProfile","-NonInteractive","-Command",command] if is_win else ["bash", "-c", command]
+    
+    retcode, stdout, stderr, timeout_reason = _run_with_inactivity_timeout(
+        args, cwd=work_dir,
+        inactivity_timeout=_SHELL_TIMEOUT,
+        max_timeout=_SHELL_MAX_TIMEOUT,
+    )
+    
+    if timeout_reason == "inactivity":
+        idle_str = f"{_SHELL_TIMEOUT}s 无输出" if _SHELL_TIMEOUT > 0 else "无限制"
+        partial = (stdout + stderr).strip()
+        partial_msg = f"\n\n已捕获的部分输出:\n{partial[:500]}" if partial else ""
+        return (f"(x) 空闲超时（命令 {_SHELL_TIMEOUT}s 无任何输出，判定为卡死）\n"
+                f"命令: {command}\n"
+                f"已运行时间内有输出，但之后陷入沉默。{partial_msg}\n\n"
+                f"可能的原因:\n"
+                f"  1. 命令启动了阻塞式进程（如服务器）等待输入\n"
+                f"  2. 命令在等待网络响应（如 npm install 网络不通）\n"
+                f"  3. 命令进入了交互模式等待用户操作\n\n"
+                f"建议:\n"
+                f"  1. 检查命令是否需要 --non-interactive 或 --yes 参数\n"
+                f"  2. 尝试添加超时参数（如 timeout 60 npm install）\n"
+                f"  3. 使用 Ctrl+C 中断后重试")
+    elif timeout_reason == "max":
+        partial = (stdout + stderr).strip()
+        partial_msg = f"\n\n已捕获的部分输出:\n{partial[:500]}" if partial else ""
+        return (f"(x) 硬超时（命令执行超过 {_SHELL_MAX_TIMEOUT}s 上限）\n"
+                f"命令: {command}{partial_msg}")
+    
+    out = (stdout + stderr).strip() or "(无输出)"
+    return f"exit={retcode}\n{out}"
 
 
 @registry.register("执行 Python 代码（子进程隔离）", risk=RiskLevel.SYSTEM, capability=Capability.PYTHON)
@@ -212,16 +311,27 @@ def run_python(work_dir: str, code: str) -> str:
         tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8")
         try:
             tmp.write(code); tmp.close()
-            timeout = _PYTHON_TIMEOUT if _PYTHON_TIMEOUT > 0 else None
-            r = subprocess.run([_sys.executable, tmp.name], cwd=work_dir,
-                               capture_output=True, text=True, timeout=timeout,
-                               env={**_os.environ, "PYTHONPATH": "", "PATH": _os.environ.get("PATH", "")})
-            out = (r.stdout + r.stderr).strip() or "(无输出)"
-            return f"exit={r.returncode}\n{out}"
+            retcode, stdout, stderr, timeout_reason = _run_with_inactivity_timeout(
+                [_sys.executable, tmp.name], cwd=work_dir,
+                env={**_os.environ, "PYTHONPATH": "", "PATH": _os.environ.get("PATH", "")},
+                inactivity_timeout=_PYTHON_TIMEOUT,
+                max_timeout=_PYTHON_MAX_TIMEOUT,
+            )
+            if timeout_reason == "inactivity":
+                partial = (stdout + stderr).strip()
+                partial_msg = f"\n\n已捕获的部分输出:\n{partial[:500]}" if partial else ""
+                return (f"(x) 空闲超时（Python 代码 {_PYTHON_TIMEOUT}s 无输出，判定为卡死）\n"
+                        f"可能的原因:\n"
+                        f"  1. 代码中有 input() 等待用户输入\n"
+                        f"  2. 代码在等待网络响应或文件 I/O\n"
+                        f"  3. 代码进入了死循环但不产生输出{partial_msg}")
+            elif timeout_reason == "max":
+                partial = (stdout + stderr).strip()
+                partial_msg = f"\n\n已捕获的部分输出:\n{partial[:500]}" if partial else ""
+                return f"(x) 硬超时（Python 代码执行超过 {_PYTHON_MAX_TIMEOUT}s 上限）{partial_msg}"
+            out = (stdout + stderr).strip() or "(无输出)"
+            return f"exit={retcode}\n{out}"
         finally: _os.unlink(tmp.name)
-    except subprocess.TimeoutExpired:
-        timeout_str = f"{_PYTHON_TIMEOUT}s" if _PYTHON_TIMEOUT > 0 else "无限制"
-        return f"(x) 超时（Python 代码执行超过 {timeout_str}）\n\n可能的原因:\n  1. 代码中有无限循环\n  2. 代码长时间等待 I/O\n  3. 代码计算量过大\n\n建议:\n  1. 添加超时控制或退出条件\n  2. 使用 Ctrl+C 中断后重试"
     except Exception as e: return f"(x) Python 沙箱异常: {e}"
 
 
