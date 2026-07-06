@@ -36,16 +36,118 @@ Cortex Agent — Harness Agent 架构 + Agentic Loop 引擎
   ctx -p "prompt"            管道模式 (从 stdin 读取输入，非交互)
   cat file.ts | ctx -p       从管道读取文件内容作为输入
   ctx --no-stream            关闭流式输出
-  ctx --resume [id]         恢复上次/指定会话的完整上下文
+  ctx -r                    恢复会话（弹出选择器）
+  ctx -r <id>               恢复指定会话
+  ctx --resume [id]         同 -r，恢复上次/指定会话的完整上下文
   ctx --mode yolo            全部放行模式
   ctx --long "task"         长时运行模式（自动续行直到完成）
   ctx --max-rounds N        限制续行轮数（0=无限）
   ctx --allowed-tools T1,T2 仅允许指定的工具
   ctx --disallowed-tools T3 禁止指定的工具
   ctx --list-sessions        列出已保存会话
-  ctx --resume <SESSION_ID>  恢复到指定会话
   ctx --init-config           创建默认 .cortx/settings.json
 `;
+
+// ════════════════════════════════════════════════════════
+// 会话选择器 — `ctx -r` / `/resume` 不带 id 时调用
+// ════════════════════════════════════════════════════════
+const CY = "\x1b[36m", GR = "\x1b[90m", DM = "\x1b[2m", BD = "\x1b[1m", G = "\x1b[0m";
+const GN = "\x1b[38;5;82m", YL = "\x1b[38;5;220m", RD = "\x1b[38;5;196m";
+
+/** 从会话 .jsonl 提取首条 user 消息作为预览（与 memory_store.getHistorySummary 同款读取） */
+function sessionPreview(sessionsDir: string, sessionId: string): string {
+  try {
+    const fpath = path.join(sessionsDir, `${path.basename(sessionId)}.jsonl`);
+    if (!fs.existsSync(fpath)) return "";
+    for (const line of fs.readFileSync(fpath, "utf-8").split("\n")) {
+      if (!line.trim()) continue;
+      let obj: Record<string, unknown>;
+      try { obj = JSON.parse(line); } catch { continue; }
+      if (obj.type === "msg" && obj.role === "user") {
+        return String(obj.content || "").replace(/\n/g, " ").trim().slice(0, 50);
+      }
+    }
+  } catch { /* ignore */ }
+  return "";
+}
+
+/** 格式化时间: ISO -> MM-DD HH:MM */
+function fmtTime(iso: string): string {
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso).slice(0, 16);
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mi = String(d.getMinutes()).padStart(2, "0");
+    return `${mm}-${dd} ${hh}:${mi}`;
+  } catch { return String(iso).slice(0, 16); }
+}
+
+/**
+ * 弹出会话选择器，返回选中的 session_id。
+ * - 返回 null 表示用户选择"新建会话"
+ * - 非 TTY 环境直接返回 undefined（由调用方走默认逻辑）
+ */
+async function promptSessionResume(
+  agent: CortexAgent,
+  rl: readline.Interface,
+  maxShow = 15
+): Promise<string | null | undefined> {
+  // @ts-ignore — sessions is private but accessible for CLI
+  const sessions = agent.sessions;
+  if (!sessions) { console.log("(会话系统不可用)"); return undefined; }
+  const list = sessions.listSessions() as Array<Record<string, unknown>>;
+  if (!list.length) {
+    console.log(`${GR}(无已保存的会话，将创建新会话)${G}`);
+    return null;
+  }
+  // 非 TTY 直接用最近会话
+  if (!process.stdin.isTTY) {
+    console.error(`${YL}[resume] 非交互环境，恢复最近会话: ${String(list[0].session_id)}${G}`);
+    return String(list[0].session_id);
+  }
+  const top = list.slice(0, maxShow);
+  // @ts-ignore
+  const sessionsDir = path.join(agent.config.workDir, "sessions");
+
+  // ── 渲染表格 ──
+  console.log(`\n${CY}╭${"─".repeat(58)}╮${G}`);
+  console.log(`${CY}│${G}  📂 历史会话 (最近 ${top.length}/${list.length} 条)${" ".repeat(Math.max(0, 58 - 22 - String(top.length).length - String(list.length).length - 8))}${CY}│${G}`);
+  console.log(`${CY}├${"─".repeat(58)}┤${G}`);
+  console.log(`${CY}│${G} ${GR}#${G}  ${GR}${"SESSION_ID".padEnd(20)}${G} ${GR}${"时间".padEnd(11)}${G} ${GR}Q${G}  ${GR}预览${G}`);
+  top.forEach((s, i) => {
+    const sid = String(s.session_id || "").slice(0, 20);
+    const la = fmtTime(String(s.last_active || ""));
+    const q = String(s.query_count || 0).padEnd(2);
+    const prev = sessionPreview(sessionsDir, String(s.session_id)) || `${GR}(空)${G}`;
+    const marker = i === 0 ? `${GN}★${G}` : `${GR} ${G}`;
+    console.log(`${CY}│${G} ${marker}${GR}${String(i + 1).padEnd(2)}${G} ${sid.padEnd(20)} ${la.padEnd(11)} ${q} ${DM}${prev.slice(0, 24)}${G}`);
+  });
+  console.log(`${CY}╰${"─".repeat(58)}╯${G}`);
+  console.log(`  ${DM}输入序号恢复 · 回车=最近(1) · 0/new=新建 · 或粘贴 session_id${G}`);
+
+  const ask = (q: string): Promise<string> => new Promise(r => rl.question(q, r));
+  // ── 输入循环 ──
+  for (;;) {
+    const input = (await ask(`  ${GN}选择:${G} `)).trim();
+    // 空 -> 最近
+    if (!input) return String(top[0].session_id);
+    // 新建
+    if (input === "0" || input.toLowerCase() === "n" || input.toLowerCase() === "new") return null;
+    // 数字序号
+    const n = parseInt(input, 10);
+    if (!isNaN(n) && n >= 1 && n <= top.length) return String(top[n - 1].session_id);
+    if (!isNaN(n)) { console.log(`  ${RD}(x) 序号超出范围 1-${top.length}${G}`); continue; }
+    // 模糊匹配 session_id（前缀或包含）
+    const matches = top.filter(s => String(s.session_id).startsWith(input) || String(s.session_id).includes(input));
+    if (matches.length === 1) return String(matches[0].session_id);
+    // 全量列表里找（用户可能粘贴了较老的 id）
+    const fullMatch = list.find(s => String(s.session_id) === input);
+    if (fullMatch) return String(fullMatch.session_id);
+    console.log(`  ${RD}(x) 无匹配，请重试${G}`);
+  }
+}
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
@@ -302,11 +404,31 @@ async function main(): Promise<void> {
   }
 
   // ── Session init ──
-  // 默认创建新会话（仅注入历史摘要），--resume 才恢复完整上下文
-  const resumeIdx = args.indexOf("--resume");
+  // 默认创建新会话（仅注入历史摘要）；-r/--resume 才恢复完整上下文
+  // -r 不带 id 时弹出选择器；带 id 直接恢复
+  const resumeIdx = args.findIndex(a => a === "--resume" || a === "-r");
   const isResume = resumeIdx >= 0;
-  if (isResume) {
-    agent.initSession(args[resumeIdx + 1], true);
+  const isFlag = (s?: string) => !s || s.startsWith("-");
+  const resumeArg = isResume ? args[resumeIdx + 1] : undefined;
+  const resumeTarget = isResume && !isFlag(resumeArg) ? resumeArg : undefined;
+
+  let resumeId: string | null | undefined = resumeTarget;
+  if (isResume && !resumeTarget) {
+    // 不带 id: 弹出选择器（banner 之前）
+    const rlPick = readline.createInterface({ input: process.stdin, output: process.stdout });
+    try { resumeId = await promptSessionResume(agent, rlPick); }
+    finally { rlPick.close(); }
+  }
+
+  if (isResume && resumeId) {
+    // 有明确目标: 恢复完整上下文
+    agent.initSession(resumeId, true);
+  } else if (isResume && resumeId === null) {
+    // 用户在选择器里选了"新建"
+    agent.initSession(undefined, false);
+  } else if (isResume) {
+    // 非 TTY 等场景退回默认 (getLastSession)
+    agent.initSession(undefined, true);
   } else {
     agent.initSession(undefined, false);
   }
@@ -428,7 +550,7 @@ async function main(): Promise<void> {
       console.log(`  \x1b[36m═══ 会话管理 ═══\x1b[0m`);
       console.log(`  \x1b[36m/save\x1b[0m           保存会话`);
       console.log(`  \x1b[36m/sessions\x1b[0m       列出会话`);
-      console.log(`  \x1b[36m/resume <id>\x1b[0m     恢复会话`);
+      console.log(`  \x1b[36m/resume [id]\x1b[0m     恢复会话 (无 id 弹选择器)`);
       console.log(`  \x1b[36m/reset\x1b[0m          重置上下文`);
       console.log(`  \x1b[36m═══ 工具 & 模型 ═══\x1b[0m`);
       console.log(`  \x1b[36m/tools\x1b[0m          列出工具`);
@@ -503,11 +625,22 @@ async function main(): Promise<void> {
       }
       showPrompt(); rl.prompt(); continue;
     }
-    // ── /resume ──
+    // ── /resume [id] ──  不带 id 弹出选择器（与 CLI `ctx -r` 一致）
+    if (q === "/resume" || q === "/r") {
+      const picked = await promptSessionResume(agent, rl);
+      if (picked && agent.resumeSession(picked)) {
+        console.log(`${GN}已恢复会话:${G} ${picked}`);
+      } else if (picked === null) {
+        console.log(`${GR}已选择新建会话${G}`);
+      } else if (picked) {
+        console.log(`${RD}(x) 会话不存在或恢复失败:${G} ${picked}`);
+      }
+      showPrompt(); rl.prompt(); continue;
+    }
     if (q.startsWith("/resume ") || q.startsWith("/r ")) {
       const target = q.split(" ").slice(1).join(" ").trim();
-      if (agent.resumeSession(target)) { console.log(`已恢复会话: ${target}`); }
-      else { console.log(`(x) 会话不存在或恢复失败: ${target}`); }
+      if (agent.resumeSession(target)) { console.log(`${GN}已恢复会话:${G} ${target}`); }
+      else { console.log(`${RD}(x) 会话不存在或恢复失败:${G} ${target}`); }
       showPrompt(); rl.prompt(); continue;
     }
     // ── /trace — 最后轨迹 ──

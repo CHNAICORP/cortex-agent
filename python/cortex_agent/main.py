@@ -6,7 +6,9 @@ Cortex Agent CLI — 入口 + 工厂函数
   python main.py --work-dir ./ws          # 工作目录
   python main.py -q "search for Python"   # 单次查询
   python main.py --no-stream              # 关闭流式输出
-  python main.py --resume <SESSION_ID>    # 恢复到指定会话的完整上下文
+  python main.py -r                       # 恢复会话（弹出选择器）
+  python main.py -r <SESSION_ID>          # 恢复到指定会话的完整上下文
+  python main.py --resume <SESSION_ID>    # 同 -r，恢复指定会话
   python main.py --list-sessions          # 列出已保存会话
   python main.py --init-config            # 创建默认 .cortex/settings.json
 """
@@ -157,6 +159,105 @@ def setup_wizard(config: 'AgentConfig', settings: dict) -> 'AgentConfig':
     return config
 
 
+def _session_preview(sessions_dir: str, session_id: str) -> str:
+    """从会话 .jsonl 提取首条 user 消息作为预览（与 SessionStore.get_history_summary 同款读取）。"""
+    try:
+        fpath = os.path.join(sessions_dir, f"{os.path.basename(session_id)}.jsonl")
+        if not os.path.isfile(fpath):
+            return ""
+        with open(fpath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") == "msg" and obj.get("role") == "user":
+                    return " ".join(str(obj.get("content", "")).split())[:50]
+    except Exception:
+        pass
+    return ""
+
+
+def _fmt_time(iso: str) -> str:
+    """ISO 时间 -> MM-DD HH:MM"""
+    try:
+        from datetime import datetime
+        d = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return d.strftime("%m-%d %H:%M")
+    except Exception:
+        return str(iso)[:16]
+
+
+def prompt_session_resume(agent: 'CortexAgent', max_show: int = 15):
+    """
+    弹出会话选择器，返回选中的 session_id。
+    - 返回 str: 选中的 session_id
+    - 返回 None: 用户选择"新建会话"
+    - 返回 "": 非 TTY 环境，由调用方走默认逻辑（get_last_session）
+    """
+    if not agent.sessions:
+        print("(会话系统不可用)")
+        return ""
+    sessions = agent.sessions.list_sessions()
+    if not sessions:
+        print(f"{Terminal.GRAY if hasattr(Terminal,'GRAY') else ''}(无已保存的会话，将创建新会话)")
+        return None
+    # 非 TTY 直接用最近会话
+    if not sys.stdin.isatty():
+        print(f"[resume] 非交互环境，恢复最近会话: {sessions[0].get('session_id', '')}", file=sys.stderr)
+        return sessions[0].get("session_id", "")
+    top = sessions[:max_show]
+    sessions_dir = os.path.join(agent.work_dir, "sessions")
+    t = Terminal(enabled=False)  # 仅用颜色常量
+    CY, GR, DM, G = t.CYAN, t.GRAY, t.DIM, t.RESET
+    GN, YL, RD = t.GREEN, t.YELLOW, t.RED
+
+    # ── 渲染表格 ──
+    print(f"\n{CY}╭{'─'*58}╮{G}")
+    print(f"{CY}│{G}  📂 历史会话 (最近 {len(top)}/{len(sessions)} 条){' ' * max(0, 58 - 22 - len(str(len(top))) - len(str(len(sessions))) - 8)}{CY}│{G}")
+    print(f"{CY}├{'─'*58}┤{G}")
+    print(f"{CY}│{G} {GR}#{G}  {GR}{'SESSION_ID':<20}{G} {GR}{'时间':<11}{G} {GR}Q{G}  {GR}预览{G}")
+    for i, s in enumerate(top):
+        sid = str(s.get("session_id", ""))[:20]
+        la = _fmt_time(str(s.get("last_active", "")))
+        q = str(s.get("query_count", 0)).ljust(2)
+        prev = _session_preview(sessions_dir, str(s.get("session_id", ""))) or f"{GR}(空){G}"
+        marker = f"{GN}★{G}" if i == 0 else f"{GR} {G}"
+        print(f"{CY}│{G} {marker}{GR}{str(i+1).ljust(2)}{G} {sid:<20} {la:<11} {q} {DM}{prev[:24]}{G}")
+    print(f"{CY}╰{'─'*58}╯{G}")
+    print(f"  {DM}输入序号恢复 · 回车=最近(1) · 0/new=新建 · 或粘贴 session_id{G}")
+
+    # ── 输入循环 ──
+    while True:
+        try:
+            inp = input(f"  {GN}选择:{G} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not inp:
+            return str(top[0].get("session_id", ""))
+        if inp == "0" or inp.lower() in ("n", "new"):
+            return None
+        # 数字序号
+        if inp.isdigit():
+            n = int(inp)
+            if 1 <= n <= len(top):
+                return str(top[n-1].get("session_id", ""))
+            print(f"  {RD}(x) 序号超出范围 1-{len(top)}{G}")
+            continue
+        # 模糊匹配 session_id（前缀或包含）
+        matches = [s for s in top if str(s.get("session_id", "")).startswith(inp) or inp in str(s.get("session_id", ""))]
+        if len(matches) == 1:
+            return str(matches[0].get("session_id", ""))
+        # 全量列表精确匹配
+        full = [s for s in sessions if str(s.get("session_id", "")) == inp]
+        if full:
+            return str(full[0].get("session_id", ""))
+        print(f"  {RD}(x) 无匹配，请重试{G}")
+
+
 def main():
     import argparse
     if hasattr(sys.stdout, 'reconfigure'):
@@ -174,7 +275,8 @@ def main():
     p.add_argument("--no-stream", action="store_true", help="关闭流式输出")
     p.add_argument("--query","-q", default=None, help="单次查询")
     p.add_argument("-p", "--pipe", default=None, metavar="PROMPT", help="管道模式 (从 stdin 读取输入，非交互)")
-    p.add_argument("--resume", default=None, metavar="SESSION_ID", help="恢复到指定会话的完整上下文")
+    p.add_argument("-r", "--resume", default=None, nargs="?", const="__PICK__", metavar="SESSION_ID",
+                   help="恢复会话: -r 弹出选择器, -r <id> 恢复指定会话")
     p.add_argument("--list-sessions", action="store_true", help="列出已保存的会话")
     p.add_argument("--init-config", action="store_true", help="创建默认 .cortex/settings.json")
     p.add_argument("--mode", default=None, choices=["standard","auto","yolo"],
@@ -261,9 +363,23 @@ def main():
         return
 
     # Determine session mode
-    # 默认创建新会话（仅注入历史摘要），--resume 才恢复完整上下文
-    if args.resume:
-        agent.init_session(session_id=args.resume, resume=True)
+    # 默认创建新会话（仅注入历史摘要）；-r/--resume 才恢复完整上下文
+    # -r 不带 id 弹出选择器；带 id 直接恢复
+    is_resume = args.resume is not None
+    resume_target = args.resume if (args.resume and args.resume != "__PICK__") else None
+    resume_id = resume_target
+    if is_resume and not resume_target:
+        # 不带 id: 弹出选择器（banner 之前）
+        resume_id = prompt_session_resume(agent)
+
+    if is_resume and resume_id:
+        agent.init_session(session_id=resume_id, resume=True)
+    elif is_resume and resume_id is None:
+        # 用户在选择器里选了"新建"
+        agent.init_session(resume=False)
+    elif is_resume:
+        # 非 TTY 等场景退回默认 (get_last_session)
+        agent.init_session(resume=True)
     else:
         agent.init_session(resume=False)
 
@@ -273,7 +389,7 @@ def main():
             sid_display = agent.session_id[:20] + "..." if len(agent.session_id) > 20 else agent.session_id
         term.banner(agent.model, len(registry.schemas), wd,
                     session_id=sid_display, mode=agent.config.permission_mode,
-                    context_limit=agent.context_limit, is_resume=bool(args.resume))
+                    context_limit=agent.context_limit, is_resume=is_resume)
 
     # ── Skills 系统通过 agent.skill_mgr 访问 ──
     # ── 管道模式 (-p) ──
@@ -341,7 +457,7 @@ def main():
             print(f"  {term.CYAN}═══ 会话管理 ═══{term.RESET}")
             print(f"  {term.CYAN}/save{term.RESET}           保存会话")
             print(f"  {term.CYAN}/sessions{term.RESET}       列出会话")
-            print(f"  {term.CYAN}/resume <id>{term.RESET}     恢复会话")
+            print(f"  {term.CYAN}/resume [id]{term.RESET}     恢复会话 (无 id 弹选择器)")
             print(f"  {term.CYAN}/reset{term.RESET}          重置上下文")
             print(f"  {term.CYAN}═══ 工具 & 模型 ═══{term.RESET}")
             print(f"  {term.CYAN}/tools{term.RESET}          列出工具")
@@ -421,8 +537,8 @@ def main():
             else:
                 print("(会话系统不可用)")
             continue
-        if q.startswith("/resume ") or q.startswith("/r "):
-            target = q.split(" ", 1)[1].strip()
+        def _do_resume(target):
+            """恢复指定会话（复用逻辑）"""
             try:
                 if agent.sessions:
                     saved_ctx, meta = agent.sessions.load(target)
@@ -438,6 +554,17 @@ def main():
                 print(f"(x) 会话不存在: {target}")
             except Exception as e:
                 print(f"(x) 恢复失败: {e}")
+        # ── /resume [id] ──  不带 id 弹出选择器（与 CLI `ctx -r` 一致）
+        if q in ("/resume", "/r"):
+            picked = prompt_session_resume(agent)
+            if picked:
+                _do_resume(picked)
+            elif picked is None:
+                print("已选择新建会话")
+            continue
+        if q.startswith("/resume ") or q.startswith("/r "):
+            target = q.split(" ", 1)[1].strip()
+            _do_resume(target)
             continue
         if q in ("/memory", "/mem"):
             if agent.memory:
