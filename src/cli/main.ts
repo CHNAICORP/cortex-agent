@@ -84,6 +84,26 @@ function fmtTime(iso: string): string {
   } catch { return String(iso).slice(0, 16); }
 }
 
+/** 渲染单行会话（带高亮选中项）。返回不含换行的行字符串。 */
+function renderSessionRow(
+  s: Record<string, unknown>, idx: number, total: number,
+  sessionsDir: string, selected: boolean
+): string {
+  const sid = String(s.session_id || "").slice(0, 20);
+  const la = fmtTime(String(s.last_active || ""));
+  const q = String(s.query_count || 0).padEnd(2);
+  const prev = sessionPreview(sessionsDir, String(s.session_id)) || "(空)";
+  const num = String(idx + 1).padStart(2);
+  // 选中行: ▸ + 绿底反色; 普通: 空格 + 灰色
+  if (selected) {
+    const HL = "\x1b[32m\x1b[1m";  // 绿色加粗
+    const BG = "\x1b[48;5;238m";   // 深灰底
+    return `${CY}│${G} ${BG}▸${HL}${num} ${sid.padEnd(20)} ${la.padEnd(11)} ${q} ${prev.slice(0, 24).padEnd(24)}${G}   ${CY}│${G}`;
+  }
+  const marker = idx === 0 ? `${GN}★${G}` : `${GR} ${G}`;
+  return `${CY}│${G} ${marker}${GR}${num}${G} ${sid.padEnd(20)} ${la.padEnd(11)} ${q} ${DM}${prev.slice(0, 24)}${G}`;
+}
+
 /**
  * 弹出会话选择器，返回选中的 session_id。
  * - 返回 null 表示用户选择"新建会话"
@@ -110,43 +130,116 @@ async function promptSessionResume(
   const top = list.slice(0, maxShow);
   // @ts-ignore
   const sessionsDir = path.join(agent.config.workDir, "sessions");
+  const n = top.length;
 
-  // ── 渲染表格 ──
-  console.log(`\n${CY}╭${"─".repeat(58)}╮${G}`);
-  console.log(`${CY}│${G}  📂 历史会话 (最近 ${top.length}/${list.length} 条)${" ".repeat(Math.max(0, 58 - 22 - String(top.length).length - String(list.length).length - 8))}${CY}│${G}`);
-  console.log(`${CY}├${"─".repeat(58)}┤${G}`);
-  console.log(`${CY}│${G} ${GR}#${G}  ${GR}${"SESSION_ID".padEnd(20)}${G} ${GR}${"时间".padEnd(11)}${G} ${GR}Q${G}  ${GR}预览${G}`);
-  top.forEach((s, i) => {
-    const sid = String(s.session_id || "").slice(0, 20);
-    const la = fmtTime(String(s.last_active || ""));
-    const q = String(s.query_count || 0).padEnd(2);
-    const prev = sessionPreview(sessionsDir, String(s.session_id)) || `${GR}(空)${G}`;
-    const marker = i === 0 ? `${GN}★${G}` : `${GR} ${G}`;
-    console.log(`${CY}│${G} ${marker}${GR}${String(i + 1).padEnd(2)}${G} ${sid.padEnd(20)} ${la.padEnd(11)} ${q} ${DM}${prev.slice(0, 24)}${G}`);
-  });
-  console.log(`${CY}╰${"─".repeat(58)}╯${G}`);
-  console.log(`  ${DM}输入序号恢复 · 回车=最近(1) · 0/new=新建 · 或粘贴 session_id${G}`);
+  // ── 渲染表头 ──
+  const headerLines: string[] = [
+    `\n${CY}╭${"─".repeat(58)}╮${G}`,
+    `${CY}│${G}  📂 历史会话 (最近 ${top.length}/${list.length} 条)${" ".repeat(Math.max(0, 58 - 22 - String(top.length).length - String(list.length).length - 8))}${CY}│${G}`,
+    `${CY}├${"─".repeat(58)}┤${G}`,
+    `${CY}│${G} ${GR}#${G}  ${GR}${"SESSION_ID".padEnd(20)}${G} ${GR}${"时间".padEnd(11)}${G} ${GR}Q${G}  ${GR}预览${G}`,
+  ];
+  for (const l of headerLines) process.stdout.write(l + "\n");
+  // 列表行（首次渲染，高亮第 0 项）
+  const renderList = (selected: number): void => {
+    for (let i = 0; i < n; i++) {
+      process.stdout.write(renderSessionRow(top[i], i, n, sessionsDir, i === selected) + "\n");
+    }
+  };
+  // 重绘列表：光标上移 n 行，从行首重写
+  const redrawList = (selected: number): void => {
+    process.stdout.write(`\x1b[${n}A`);
+    for (let i = 0; i < n; i++) {
+      process.stdout.write(`\r\x1b[2K` + renderSessionRow(top[i], i, n, sessionsDir, i === selected) + "\n");
+    }
+  };
+  const footerHint = `  ${DM}↑↓ 移动 · 回车=确认 · 0/new=新建 · 数字快捷 · 或粘贴 session_id${G}`;
 
+  // ── 文本输入回退（raw 模式不可用时）──
   const ask = (q: string): Promise<string> => new Promise(r => rl.question(q, r));
-  // ── 输入循环 ──
-  for (;;) {
-    const input = (await ask(`  ${GN}选择:${G} `)).trim();
-    // 空 -> 最近
-    if (!input) return String(top[0].session_id);
-    // 新建
-    if (input === "0" || input.toLowerCase() === "n" || input.toLowerCase() === "new") return null;
-    // 数字序号
-    const n = parseInt(input, 10);
-    if (!isNaN(n) && n >= 1 && n <= top.length) return String(top[n - 1].session_id);
-    if (!isNaN(n)) { console.log(`  ${RD}(x) 序号超出范围 1-${top.length}${G}`); continue; }
-    // 模糊匹配 session_id（前缀或包含）
-    const matches = top.filter(s => String(s.session_id).startsWith(input) || String(s.session_id).includes(input));
-    if (matches.length === 1) return String(matches[0].session_id);
-    // 全量列表里找（用户可能粘贴了较老的 id）
-    const fullMatch = list.find(s => String(s.session_id) === input);
-    if (fullMatch) return String(fullMatch.session_id);
-    console.log(`  ${RD}(x) 无匹配，请重试${G}`);
+  async function textInputLoop(): Promise<string | null> {
+    renderList(0);
+    process.stdout.write(`${CY}╰${"─".repeat(58)}╯${G}\n${footerHint}\n`);
+    for (;;) {
+      const input = (await ask(`  ${GN}选择:${G} `)).trim();
+      if (!input) return String(top[0].session_id);
+      if (input === "0" || input.toLowerCase() === "n" || input.toLowerCase() === "new") return null;
+      const num = parseInt(input, 10);
+      if (!isNaN(num) && num >= 1 && num <= n) return String(top[num - 1].session_id);
+      if (!isNaN(num)) { console.log(`  ${RD}(x) 序号超出范围 1-${n}${G}`); continue; }
+      const matches = top.filter(s => String(s.session_id).startsWith(input) || String(s.session_id).includes(input));
+      if (matches.length === 1) return String(matches[0].session_id);
+      const fullMatch = list.find(s => String(s.session_id) === input);
+      if (fullMatch) return String(fullMatch.session_id);
+      console.log(`  ${RD}(x) 无匹配，请重试${G}`);
+    }
   }
+
+  // ── raw 模式不可用 → 文本输入回退 ──
+  // @ts-ignore — setRawMode 仅 TTY 可用
+  if (typeof process.stdin.setRawMode !== "function") {
+    return await textInputLoop();
+  }
+
+  // ── 交互式高亮选择（raw 模式捕获按键）──
+  // 只打印表头 + 列表（暂不打印底框/提示），光标停在列表末行之后
+  renderList(0);
+  let selected = 0;
+
+  return await new Promise<string | null>((resolve) => {
+    const stdin = process.stdin;
+    // @ts-ignore
+    stdin.setRawMode(true);
+    stdin.setEncoding("utf-8");
+    stdin.resume();
+
+    const cleanup = (finalSel: number) => {
+      // @ts-ignore
+      stdin.setRawMode(false);
+      stdin.removeListener("data", onData);
+      // 光标已在列表末行之后；最后一次重绘确保选中态正确，再打印底框+提示
+      redrawList(finalSel);
+      process.stdout.write(`${CY}╰${"─".repeat(58)}╯${G}\n${footerHint}\n`);
+    };
+
+    const onData = (chunk: string | Buffer) => {
+      const data = Buffer.isBuffer(chunk) ? chunk.toString("utf-8") : chunk;
+      let keyName = "";
+      if (data === "\r" || data === "\n") keyName = "return";
+      else if (data === "\x03") keyName = "ctrl-c";
+      else if (data === "\x1b[A") keyName = "up";
+      else if (data === "\x1b[B") keyName = "down";
+      else if (data === "\x1b[C") keyName = "right";
+      else if (data === "\x1b[D") keyName = "left";
+      else if (data === "\x1b") keyName = "escape";
+
+      if (keyName === "up") {
+        selected = (selected - 1 + n) % n;
+        redrawList(selected);
+      } else if (keyName === "down") {
+        selected = (selected + 1) % n;
+        redrawList(selected);
+      } else if (keyName === "return") {
+        cleanup(selected);
+        resolve(String(top[selected].session_id));
+      } else if (keyName === "ctrl-c" || keyName === "escape") {
+        cleanup(selected);
+        resolve(null);  // 放弃 → 新建会话
+      } else if (data >= "1" && data <= "9") {
+        const num = parseInt(data, 10);
+        if (num >= 1 && num <= n) {
+          selected = num - 1;
+          cleanup(selected);
+          resolve(String(top[selected].session_id));
+        }
+      } else if (data === "0") {
+        cleanup(selected);
+        resolve(null);  // 新建
+      }
+      // 其他按键忽略；用户可用回车确认当前高亮项
+    };
+    stdin.on("data", onData);
+  });
 }
 
 async function main(): Promise<void> {

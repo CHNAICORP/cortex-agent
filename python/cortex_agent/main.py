@@ -191,6 +191,59 @@ def _fmt_time(iso: str) -> str:
         return str(iso)[:16]
 
 
+def _read_key() -> str:
+    """
+    跨平台读取单按键，返回 key name。
+    - 方向键: "up" / "down" / "left" / "right"
+    - 回车: "return"
+    - Ctrl+C / ESC: "cancel"
+    - 数字/字符: 原样返回
+    - 读取失败: 返回 "" (调用方据此回退到文本输入)
+    win32: msvcrt.getwch (方向键为 0x00/0xe0 前缀 + 第二字节)
+    unix:  termios + tty.setcbreak (方向键为 ESC[A/B/C/D)
+    """
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):
+                ch2 = msvcrt.getwch()
+                return {"H": "up", "P": "down", "K": "left", "M": "right"}.get(ch2, "")
+            return {"\r": "return", "\n": "return", "\x03": "cancel", "\x1b": "cancel"}.get(ch, ch)
+        else:
+            import termios, tty
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                ch = sys.stdin.read(1)
+                if ch == "\x1b":
+                    seq = sys.stdin.read(2)
+                    return {"[A": "up", "[B": "down", "[C": "right", "[D": "left"}.get(seq, "cancel")
+                return {"\r": "return", "\n": "return", "\x03": "cancel"}.get(ch, ch)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        return ""
+
+
+def _render_session_row(s: dict, idx: int, sessions_dir: str, selected: bool, t) -> str:
+    """渲染单行会话。selected=True 时高亮（绿底/反色）。返回不含换行的行。"""
+    sid = str(s.get("session_id", ""))[:20]
+    la = _fmt_time(str(s.get("last_active", "")))
+    q = str(s.get("query_count", 0)).ljust(2)
+    prev = _session_preview(sessions_dir, str(s.get("session_id", ""))) or "(空)"
+    num = str(idx + 1).rjust(2)
+    CY, GR, DM, G = t.CYAN, t.GRAY, t.DIM, t.RESET
+    GN = t.GREEN
+    if selected:
+        HL = "\033[32m\033[1m"   # 绿色加粗
+        BG = "\033[48;5;238m"    # 深灰底
+        return f"{CY}│{G} {BG}▸{HL}{num} {sid:<20} {la:<11} {q} {prev[:24]:<24}{G}   {CY}│{G}"
+    marker = f"{GN}★{G}" if idx == 0 else f"{GR} {G}"
+    return f"{CY}│{G} {marker}{GR}{num}{G} {sid:<20} {la:<11} {q} {DM}{prev[:24]}{G}"
+
+
 def prompt_session_resume(agent: 'CortexAgent', max_show: int = 15):
     """
     弹出会话选择器，返回选中的 session_id。
@@ -214,48 +267,110 @@ def prompt_session_resume(agent: 'CortexAgent', max_show: int = 15):
     t = Terminal(enabled=False)  # 仅用颜色常量
     CY, GR, DM, G = t.CYAN, t.GRAY, t.DIM, t.RESET
     GN, YL, RD = t.GREEN, t.YELLOW, t.RED
+    n = len(top)
 
-    # ── 渲染表格 ──
-    print(f"\n{CY}╭{'─'*58}╮{G}")
-    print(f"{CY}│{G}  📂 历史会话 (最近 {len(top)}/{len(sessions)} 条){' ' * max(0, 58 - 22 - len(str(len(top))) - len(str(len(sessions))) - 8)}{CY}│{G}")
-    print(f"{CY}├{'─'*58}┤{G}")
-    print(f"{CY}│{G} {GR}#{G}  {GR}{'SESSION_ID':<20}{G} {GR}{'时间':<11}{G} {GR}Q{G}  {GR}预览{G}")
-    for i, s in enumerate(top):
-        sid = str(s.get("session_id", ""))[:20]
-        la = _fmt_time(str(s.get("last_active", "")))
-        q = str(s.get("query_count", 0)).ljust(2)
-        prev = _session_preview(sessions_dir, str(s.get("session_id", ""))) or f"{GR}(空){G}"
-        marker = f"{GN}★{G}" if i == 0 else f"{GR} {G}"
-        print(f"{CY}│{G} {marker}{GR}{str(i+1).ljust(2)}{G} {sid:<20} {la:<11} {q} {DM}{prev[:24]}{G}")
-    print(f"{CY}╰{'─'*58}╯{G}")
-    print(f"  {DM}输入序号恢复 · 回车=最近(1) · 0/new=新建 · 或粘贴 session_id{G}")
+    # ── 渲染表头 + 列表 ──
+    def _print_header():
+        print(f"\n{CY}╭{'─'*58}╮{G}")
+        print(f"{CY}│{G}  📂 历史会话 (最近 {len(top)}/{len(sessions)} 条){' ' * max(0, 58 - 22 - len(str(len(top))) - len(str(len(sessions))) - 8)}{CY}│{G}")
+        print(f"{CY}├{'─'*58}┤{G}")
+        print(f"{CY}│{G} {GR}#{G}  {GR}{'SESSION_ID':<20}{G} {GR}{'时间':<11}{G} {GR}Q{G}  {GR}预览{G}")
 
-    # ── 输入循环 ──
+    def _render_list(selected):
+        for i, s in enumerate(top):
+            sys.stdout.write(_render_session_row(s, i, sessions_dir, i == selected, t) + "\n")
+
+    def _redraw_list(selected):
+        # 光标上移 n 行，逐行重写（清行）
+        sys.stdout.write(f"\x1b[{n}A")
+        for i, s in enumerate(top):
+            sys.stdout.write("\r\x1b[2K" + _render_session_row(s, i, sessions_dir, i == selected, t) + "\n")
+        sys.stdout.flush()
+
+    footer_hint = f"  {DM}↑↓ 移动 · 回车=确认 · 0/new=新建 · 数字快捷 · 或粘贴 session_id{G}"
+
+    # ── 文本输入回退（_read_key 不可用时）──
+    def _text_input_loop():
+        _print_header()
+        _render_list(0)
+        print(f"{CY}╰{'─'*58}╯{G}")
+        print(footer_hint)
+        while True:
+            try:
+                inp = input(f"  {GN}选择:{G} ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if not inp:
+                return str(top[0].get("session_id", ""))
+            if inp == "0" or inp.lower() in ("n", "new"):
+                return None
+            if inp.isdigit():
+                num = int(inp)
+                if 1 <= num <= n:
+                    return str(top[num-1].get("session_id", ""))
+                print(f"  {RD}(x) 序号超出范围 1-{n}{G}")
+                continue
+            matches = [s for s in top if str(s.get("session_id", "")).startswith(inp) or inp in str(s.get("session_id", ""))]
+            if len(matches) == 1:
+                return str(matches[0].get("session_id", ""))
+            full = [s for s in sessions if str(s.get("session_id", "")) == inp]
+            if full:
+                return str(full[0].get("session_id", ""))
+            print(f"  {RD}(x) 无匹配，请重试{G}")
+
+    # ── 检测 raw 按键读取是否可用（win32=msvcrt, unix=termios）──
+    _raw_ok = False
+    try:
+        if sys.platform == "win32":
+            import msvcrt  # noqa: F401
+            _raw_ok = True
+        else:
+            import termios  # noqa: F401
+            _raw_ok = True
+    except ImportError:
+        _raw_ok = False
+
+    # raw 不可用 → 文本输入回退
+    if not _raw_ok:
+        return _text_input_loop()
+
+    # ── 交互式高亮选择 ──
+    _print_header()
+    _render_list(0)
+    selected = 0
     while True:
-        try:
-            inp = input(f"  {GN}选择:{G} ").strip()
-        except (EOFError, KeyboardInterrupt):
+        key = _read_key()
+        # _read_key 读取失败 → 回退文本输入
+        if key == "":
+            return _text_input_loop()
+        if key == "up":
+            selected = (selected - 1 + n) % n
+            _redraw_list(selected)
+        elif key == "down":
+            selected = (selected + 1) % n
+            _redraw_list(selected)
+        elif key == "return":
+            _redraw_list(selected)
+            print(f"{CY}╰{'─'*58}╯{G}")
+            print(footer_hint)
+            return str(top[selected].get("session_id", ""))
+        elif key == "cancel":
+            _redraw_list(selected)
+            print(f"{CY}╰{'─'*58}╯{G}")
+            print(footer_hint)
             return None
-        if not inp:
-            return str(top[0].get("session_id", ""))
-        if inp == "0" or inp.lower() in ("n", "new"):
+        elif key == "0":
+            _redraw_list(selected)
+            print(f"{CY}╰{'─'*58}╯{G}")
+            print(footer_hint)
             return None
-        # 数字序号
-        if inp.isdigit():
-            n = int(inp)
-            if 1 <= n <= len(top):
-                return str(top[n-1].get("session_id", ""))
-            print(f"  {RD}(x) 序号超出范围 1-{len(top)}{G}")
-            continue
-        # 模糊匹配 session_id（前缀或包含）
-        matches = [s for s in top if str(s.get("session_id", "")).startswith(inp) or inp in str(s.get("session_id", ""))]
-        if len(matches) == 1:
-            return str(matches[0].get("session_id", ""))
-        # 全量列表精确匹配
-        full = [s for s in sessions if str(s.get("session_id", "")) == inp]
-        if full:
-            return str(full[0].get("session_id", ""))
-        print(f"  {RD}(x) 无匹配，请重试{G}")
+        elif key and key.isdigit() and 1 <= int(key) <= n:
+            selected = int(key) - 1
+            _redraw_list(selected)
+            print(f"{CY}╰{'─'*58}╯{G}")
+            print(footer_hint)
+            return str(top[selected].get("session_id", ""))
+        # 其他按键忽略
 
 
 def main():
