@@ -39,18 +39,51 @@ function runWithInactivityTimeout(
     let timeoutReason: string | null = null;
     let settled = false;
 
+    /** 强制终止整个进程树（Windows: taskkill /T /F；Unix: 进程组 kill）。
+     *  仅 proc.kill() 会留下孤儿子进程，导致继承的 stdio 管道不关闭，
+     *  'close' 事件永不触发 → Promise 永不 resolve → agent 卡死。*/
+    const killTree = () => {
+      try {
+        if (process.platform === "win32" && proc.pid) {
+          // /T = 连同子进程，/F = 强制
+          spawnSync("taskkill", ["/T", "/F", "/PID", String(proc.pid)], { stdio: "ignore" });
+        } else {
+          try { if (proc.pid) process.kill(-proc.pid, "SIGKILL"); } catch { proc.kill("SIGKILL"); }
+        }
+      } catch { /* 尽力而为 */ }
+      try { proc.kill(); } catch { /* 已退出 */ }
+    };
+
+    /** 安全网：kill 后若 3s 内 'close' 仍未触发（孤儿进程持有管道），
+     *  强制 resolve，避免 agent 永久卡死。*/
+    const forceResolveGuard = () => {
+      setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          resolve({
+            retcode: null,
+            stdout: Buffer.concat(stdoutChunks).toString("utf-8").trim(),
+            stderr: Buffer.concat(stderrChunks).toString("utf-8").trim(),
+            timeoutReason: timeoutReason || "force",
+          });
+        }
+      }, 3000);
+    };
+
     const inactivityTimer = setInterval(() => {
       if (settled) return;
       const idle = (Date.now() - lastActivity) / 1000;
       const total = (Date.now() - startTime) / 1000;
       if (idle > INACTIVITY_TIMEOUT) {
         timeoutReason = "inactivity";
-        proc.kill();
         clearInterval(inactivityTimer);
+        killTree();
+        forceResolveGuard();
       } else if (total > MAX_TIMEOUT) {
         timeoutReason = "max";
-        proc.kill();
         clearInterval(inactivityTimer);
+        killTree();
+        forceResolveGuard();
       }
     }, 500); // 500ms 轮询
 

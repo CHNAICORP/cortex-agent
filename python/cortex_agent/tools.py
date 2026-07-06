@@ -76,19 +76,35 @@ def _run_with_inactivity_timeout(args, cwd, env=None, inactivity_timeout=30, max
       timed_out_reason: None=正常结束, "inactivity"=空闲超时, "max"=硬上限超时
     """
     import threading
-    
+
     proc = subprocess.Popen(
         args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding='utf-8', errors='replace',
         env=env,
     )
-    
+
     stdout_lines = []
     stderr_lines = []
     last_activity = [time.time()]
     start_time = time.time()
     timed_out = [None]  # None | "inactivity" | "max"
-    
+
+    def kill_tree():
+        """强制终止整个进程树。
+        仅 proc.kill() 会留下孤儿子进程（如 cmd /c start 分离的 GUI 应用），
+        继承的 stdio 管道不关闭 → proc.wait() 永久阻塞 → agent 卡死。"""
+        try:
+            if sys.platform == "win32" and proc.pid:
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            else:
+                import os, signal
+                try: os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception: proc.kill()
+        except Exception:
+            try: proc.kill()
+            except Exception: pass
+
     def read_stream(stream, buf_list):
         """逐行读取输出，更新最后活动时间"""
         try:
@@ -97,41 +113,46 @@ def _run_with_inactivity_timeout(args, cwd, env=None, inactivity_timeout=30, max
                 last_activity[0] = time.time()
         except Exception:
             pass
-    
+
     # 启动两个线程分别读取 stdout 和 stderr
     t_out = threading.Thread(target=read_stream, args=(proc.stdout, stdout_lines), daemon=True)
     t_err = threading.Thread(target=read_stream, args=(proc.stderr, stderr_lines), daemon=True)
     t_out.start()
     t_err.start()
-    
+
     # 主线程：监控超时
     while True:
         ret = proc.poll()
         if ret is not None:
             # 进程已结束
             break
-        
+
         now = time.time()
         idle = now - last_activity[0]
         total = now - start_time
-        
+
         if inactivity_timeout > 0 and idle > inactivity_timeout:
             timed_out[0] = "inactivity"
-            proc.kill()
+            kill_tree()
             break
-        
+
         if max_timeout > 0 and total > max_timeout:
             timed_out[0] = "max"
-            proc.kill()
+            kill_tree()
             break
-        
+
         time.sleep(0.2)  # 200ms 轮询
     
     # 等待读取线程完成
     t_out.join(timeout=2)
     t_err.join(timeout=2)
-    proc.wait()
-    
+    # 安全网：kill 后 proc.wait() 可能因孤儿子进程持有管道而阻塞，
+    # 最多等 3s，超时则放弃等待（returncode 保持 None）
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        pass
+
     stdout = "".join(stdout_lines).strip()
     stderr = "".join(stderr_lines).strip()
     return proc.returncode, stdout, stderr, timed_out[0]
