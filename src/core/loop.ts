@@ -445,13 +445,14 @@ export class ToolExecutor {
   maxResultChars: number;
 
   // snake_case → camelCase 别名映射，使 TS 端兼容 Python 风格的参数名
+  // 注意: task_id 不在此映射中，因为 task_update 工具直接使用 args["task_id"]（snake_case）
   private static SNAKE_ALIASES: Record<string, string> = {
     "file_path": "filePath", "dir_path": "dirPath", "out_path": "outPath",
     "old_string": "oldString", "new_string": "newString",
     "file_a": "fileA", "file_b": "fileB", "glob_filter": "globFilter",
     "max_results": "maxResults", "max_chars": "maxChars",
     "allowed_domains": "allowedDomains", "blocked_domains": "blockedDomains",
-    "branch_name": "branchName", "task_id": "taskId",
+    "branch_name": "branchName",
   };
 
   constructor(workDir: string, timeout = 10, maxResultChars = 0) {

@@ -24,7 +24,72 @@
   "engines": {
     "node": ">=18"
   },
-  "main": "./dist/cli/main.js",
+  "main": "./dist/core/loop.js",
+  "exports": {
+    ".": {
+      "types": "./dist/core/loop.d.ts",
+      "default": "./dist/core/loop.js"
+    },
+    "./core/types": {
+      "types": "./dist/core/types.d.ts",
+      "default": "./dist/core/types.js"
+    },
+    "./core/registry": {
+      "types": "./dist/core/registry.d.ts",
+      "default": "./dist/core/registry.js"
+    },
+    "./core/policy": {
+      "types": "./dist/core/policy.d.ts",
+      "default": "./dist/core/policy.js"
+    },
+    "./core/llm": {
+      "types": "./dist/core/llm.d.ts",
+      "default": "./dist/core/llm.js"
+    },
+    "./core/memory_store": {
+      "types": "./dist/core/memory_store.d.ts",
+      "default": "./dist/core/memory_store.js"
+    },
+    "./core/tool_context": {
+      "types": "./dist/core/tool_context.d.ts",
+      "default": "./dist/core/tool_context.js"
+    },
+    "./core/loop": {
+      "types": "./dist/core/loop.d.ts",
+      "default": "./dist/core/loop.js"
+    },
+    "./tools/file": {
+      "default": "./dist/tools/file.js"
+    },
+    "./tools/exec": {
+      "default": "./dist/tools/exec.js"
+    },
+    "./tools/net": {
+      "default": "./dist/tools/net.js"
+    },
+    "./tools/memory": {
+      "default": "./dist/tools/memory.js"
+    },
+    "./tools/mcp": {
+      "default": "./dist/tools/mcp.js"
+    },
+    "./tools/browser": {
+      "default": "./dist/tools/browser.js"
+    },
+    "./tools/proxy": {
+      "default": "./dist/tools/proxy.js"
+    },
+    "./tools/subagent": {
+      "default": "./dist/tools/subagent.js"
+    },
+    "./tools/git": {
+      "default": "./dist/tools/git.js"
+    },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "default": "./dist/config.js"
+    }
+  },
   "scripts": {
     "prepublishOnly": "npx tsc"
   },

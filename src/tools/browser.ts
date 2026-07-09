@@ -231,20 +231,65 @@ registry.register(
     const ws = await getBrowserWs();
     if (!ws) return "(x) 浏览器自动启动失败。请手动启动: start msedge --remote-debugging-port=9222 --user-data-dir=%TEMP%\\cortex-browser-profile";
     try {
-      // 在新页面中导航
-      const encodedUrl = encodeURIComponent(url);
-      const pageInfo = await _httpPut(9222, `/json/new?url=${encodedUrl}`);
-      const title = pageInfo.title || "?";
-      const wsUrl = pageInfo.webSocketDebuggerUrl || "";
-      return `已在浏览器中打开: ${url}\n标题: ${title}\nWebSocket: ${wsUrl.slice(0, 60)}...`;
-    } catch (e: any) {
-      // 如果 PUT /json/new 失败（某些浏览器版本不支持），尝试用已有页面导航
+      // 1. 获取已有页面列表
+      const pages = await _httpGet(9222, "/json");
+      let targetPage: any = null;
+
+      if (Array.isArray(pages) && pages.length > 0) {
+        // 找到第一个 type=page 的标签页
+        targetPage = pages.find((p: any) => p.type === "page" && p.webSocketDebuggerUrl);
+      }
+
+      // 2. 如果没有可用页面，创建新标签页（不带 URL 参数，避免不同浏览器版本的兼容性问题）
+      if (!targetPage) {
+        try {
+          const newPage = await _httpPut(9222, "/json/new");
+          if (newPage && newPage.webSocketDebuggerUrl) {
+            targetPage = newPage;
+            // 等待页面初始化
+            await new Promise(r => setTimeout(r, 500));
+          }
+        } catch { /* some browsers don't support PUT /json/new */ }
+      }
+
+      if (!targetPage || !targetPage.webSocketDebuggerUrl) {
+        return `(x) 无法获取浏览器页面 WebSocket。请确认浏览器已启动: start msedge --remote-debugging-port=9222 --user-data-dir=%TEMP%\\cortex-browser-profile`;
+      }
+
+      // 3. 通过 CDP WebSocket 发送 Page.navigate 命令（可靠导航，兼容所有浏览器版本）
+      const cdpCmd = JSON.stringify({
+        id: 1,
+        method: "Page.navigate",
+        params: { url: url },
+      });
+      const resultRaw = await _cdpWsSend(targetPage.webSocketDebuggerUrl, cdpCmd, 10000);
+
+      if (!resultRaw) {
+        return `(x) CDP 导航无响应。URL: ${url}`;
+      }
+
+      const result = JSON.parse(resultRaw);
+      const navResult = result?.result;
+
+      if (navResult?.errorText) {
+        return `(x) 导航失败: ${navResult.errorText}\nURL: ${url}`;
+      }
+
+      // 等待页面加载
+      await new Promise(r => setTimeout(r, 1000));
+
+      // 4. 获取导航后的页面信息
+      let title = "?";
       try {
-        const pages = await _httpGet(9222, "/json");
-        if (Array.isArray(pages) && pages.length > 0) {
-          return `浏览器已启动 (${pages.length} 个页面)。URL: ${url}\n提示: 浏览器可能已打开，请在浏览器中手动访问该地址。`;
+        const updatedPages = await _httpGet(9222, "/json");
+        if (Array.isArray(updatedPages)) {
+          const updated = updatedPages.find((p: any) => p.webSocketDebuggerUrl === targetPage.webSocketDebuggerUrl);
+          if (updated) title = updated.title || "?";
         }
       } catch { /* ignore */ }
+
+      return `已在浏览器中导航到: ${url}\n页面标题: ${title}`;
+    } catch (e: any) {
       return `(x) 浏览器错误: ${e.message || e}\n请确认浏览器已启动: start msedge --remote-debugging-port=9222 --user-data-dir=%TEMP%\\cortex-browser-profile`;
     }
   },
