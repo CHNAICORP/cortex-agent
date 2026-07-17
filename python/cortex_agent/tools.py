@@ -16,7 +16,7 @@ Cortex Agent 工具实现 — 所有工具注册到 registry
   子代理:   spawn_subagent
 """
 
-import os, re, sqlite3, platform, subprocess, datetime, json, csv, io, threading, time
+import os, re, sys, sqlite3, platform, subprocess, datetime, json, csv, io, threading, time
 import urllib.parse, urllib.request, urllib.error
 from .cortex_agent import registry, RiskLevel, Capability, check_ssrf
 
