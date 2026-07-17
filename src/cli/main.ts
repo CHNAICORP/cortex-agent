@@ -288,7 +288,8 @@ async function main(): Promise<void> {
       web_search: { provider: "duckduckgo", brave_api_key: "", serpapi_api_key: "", tavily_api_key: "", max_results: 5, timeout: 10 },
       max_steps: 0, context_limit: 0, max_tokens: 0, max_input_tokens: 0, permission_mode: "standard",
       compress_threshold: 1500, compress_head: 600, compress_tail: 400, safety_margin: 4096,
-      input_warn_pct: 80, input_force_pct: 90, max_result_chars: 2000, memory_inject_count: 30,
+      input_warn_pct: 80, input_force_pct: 90, compact_input_pct: 85, compact_keep_recent: 12,
+      max_result_chars: 2000, memory_inject_count: 30,
       auto_extract_memory: true, memory_enabled: true, sessions_enabled: true,
     };
     fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
@@ -393,7 +394,8 @@ async function main(): Promise<void> {
       providers: { [prov]: { api_key: apiKey, base_url: baseUrls[prov], models: { [modelAlias]: modelName } } },
       max_steps: 0, context_limit: 0, max_tokens: 0, max_input_tokens: 0, permission_mode: "standard",
       compress_threshold: 1500, compress_head: 600, compress_tail: 400, safety_margin: 4096,
-      input_warn_pct: 80, input_force_pct: 90, max_result_chars: 10000, memory_inject_count: 30,
+      input_warn_pct: 80, input_force_pct: 90, compact_input_pct: 85, compact_keep_recent: 12,
+      max_result_chars: 10000, memory_inject_count: 30,
       auto_extract_memory: true, memory_enabled: true, sessions_enabled: true,
     };
     fs.mkdirSync(path.dirname(userPath), { recursive: true });
@@ -450,7 +452,9 @@ async function main(): Promise<void> {
     checkpointInterval: (settings.checkpoint_interval as number) || 5,
     retryMax: (settings.retry_max as number) ?? 5,
     retryBaseDelay: (settings.retry_base_delay as number) || 2,
-    compactThreshold: (settings.compact_threshold as number) || 60,
+    compactThreshold: (settings.compact_threshold as number) || 0,
+    compactInputPct: (settings.compact_input_pct as number) || 85,
+    compactKeepRecent: (settings.compact_keep_recent as number) || 12,
   });
 
   // ── 加载 Hooks 配置 ──

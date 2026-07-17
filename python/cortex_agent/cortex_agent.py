@@ -324,6 +324,11 @@ class ContextGovernor:
     # 输入 token 预警线（占 max_input_tokens 的百分比）
     INPUT_WARN_PCT = 80
     INPUT_FORCE_PCT = 90
+    # ── 缓存友好的 compact 触发（token 预算驱动，替代旧的条数触发）──
+    # 输入 token 达 max_input_tokens × COMPACT_INPUT_PCT% 才一次性 compact；
+    # 平时 govern() 零触碰历史（append-only，前缀逐字节稳定 → 缓存全命中）
+    COMPACT_INPUT_PCT = 85
+    COMPACT_KEEP_RECENT = 12
 
     def __init__(self, system: str = "", work_dir: str = "", max_msgs: int = 24,
                  memory_context: str = "", history_summary: str = "",
@@ -331,7 +336,8 @@ class ContextGovernor:
                  max_input_tokens: int = 0, max_tokens: int = 16384,
                  compress_threshold: int = 0, compress_head: int = 0,
                  compress_tail: int = 0, safety_margin: int = 0,
-                 input_warn_pct: int = 0, input_force_pct: int = 0):
+                 input_warn_pct: int = 0, input_force_pct: int = 0,
+                 compact_input_pct: int = 0, compact_keep_recent: int = 0):
         parts = [system or DEFAULT_SYSTEM]
         if kb_context:
             parts.append(f"\n[项目知识库]\n{kb_context}")
@@ -353,6 +359,8 @@ class ContextGovernor:
         self.safety_margin = safety_margin or ContextGovernor.SAFETY_MARGIN
         self.input_warn_pct = input_warn_pct or ContextGovernor.INPUT_WARN_PCT
         self.input_force_pct = input_force_pct or ContextGovernor.INPUT_FORCE_PCT
+        self.compact_input_pct = compact_input_pct or ContextGovernor.COMPACT_INPUT_PCT
+        self.compact_keep_recent = compact_keep_recent or ContextGovernor.COMPACT_KEEP_RECENT
         # max_input_tokens: 0 = 自动计算 (context_limit - max_tokens - safety_margin)
         if max_input_tokens and max_input_tokens > 0:
             self.max_input_tokens = max_input_tokens
@@ -431,74 +439,35 @@ class ContextGovernor:
         ctx.append({"role": "user", "content": query}); return ctx
 
     def govern(self, msgs: List[Dict]) -> List[Dict]:
-        """三重裁剪：条数裁剪 + tool result 压缩 + 输入 token 体积管控。
+        """缓存友好的上下文治理 — 前缀稳定优先（append-only）。
 
-        裁剪策略（参考 Claude Code 的 context window 管理）:
-          1. 按条数裁剪到 max_msgs，保留最近一轮 tool_call+result 配对
-          2. 遍历保留的消息，对超长 tool result 执行首尾压缩
-          3. 输入 token 三级预警:
-             ≥80% max_input_tokens → 压缩所有 tool result（即使未超 COMPRESS_THRESHOLD 的也强制压缩）
-             ≥90% max_input_tokens → 丢弃最早的非 system 消息
-             ≥100% max_input_tokens → 只保留 system + 最近 3 条
+        设计原则（对齐 Claude Code / zcode 的 prompt-cache 优化）:
+          - 低于压缩预算时**零触碰**：不裁剪条数、不改写历史 tool result、
+            不往历史中间插入标记消息，保证请求前缀逐字节稳定，
+            最大化 provider 前缀缓存命中率（GLM/DeepSeek/OpenAI 为自动前缀缓存，
+            Anthropic 走 cache_control 断点缓存）
+          - 达到 token 预算（compact_input_pct% × max_input_tokens）才一次性
+            compact，接受这一次全量缓存重建，之后继续全命中
+          - compact 后仍超硬上限时，兜底只保留 system + 最近 3 条
         """
-        # Step 1: 条数裁剪
-        if len(msgs) <= self.max_msgs:
-            result = list(msgs)
-        else:
-            limit = self.max_msgs - 1; reserve = set(); has_pair = False
-            for i in range(len(msgs) - 1, 1, -1):
-                if msgs[i].get("role") == "tool" and msgs[i - 1].get("tool_calls"):
-                    reserve = {i - 1, i}; has_pair = True; limit -= 2; break
-            kept = []; i = len(msgs) - 1
-            while i > 0 and len(kept) < max(limit, 0):
-                if i in reserve: i -= 1; continue
-                kept.append(msgs[i]); i -= 1
-            kept.reverse()
-            if has_pair:
-                a, t = sorted(reserve)
-                kept.append(msgs[a]); kept.append(msgs[t])
-            trimmed = len(msgs) - 1 - len(kept)
-            if trimmed > 0:
-                kept.insert(0, {"role": "system", "content": f"[{trimmed}条历史已压缩]"})
-                while len(kept) > self.max_msgs - 1: kept.pop(1 if len(kept) > 1 else 0)
-            result = [msgs[0]] + kept
-
-        # Step 2: 压缩超长 tool result
-        for m in result:
-            if m.get("role") == "tool":
-                content = m.get("content", "")
-                if isinstance(content, str) and len(content) > self.compress_threshold:
-                    m["content"] = self._compress_result(content)
-
-        # Step 3: 输入 token 体积管控（三级预警）
-        input_tokens = self.estimate_tokens(result)
-        warn_threshold = int(self.max_input_tokens * self.input_warn_pct / 100)
-        force_threshold = int(self.max_input_tokens * self.input_force_pct / 100)
-
-        if input_tokens >= self.max_input_tokens:
-            # HARD: 只保留 system + 最近 3 条
-            if len(result) > 4:
-                result = [result[0]] + result[-3:]
-        elif input_tokens >= force_threshold:
-            # FORCE: 逐步丢弃最早的非 system 消息，直到降到 force_threshold 以下
-            while len(result) > 4 and self.estimate_tokens(result) >= force_threshold:
-                result.pop(1)
-            # 压缩标记
-            result.insert(1, {"role": "system", "content": "[上下文压力过高，已强制裁剪历史]"})
-        elif input_tokens >= warn_threshold:
-            # WARN: 强制压缩所有 tool result（包括未超阈值的）
-            for m in result:
-                if m.get("role") == "tool":
-                    content = m.get("content", "")
-                    if isinstance(content, str) and len(content) > 200:
-                        m["content"] = self._compress_result(content)
-
-        # Step 4: 修复 tool_calls/tool 配对完整性
-        # 裁剪可能打破 assistant(tool_calls) → tool(result) 的配对关系
-        # 导致 LLM API 报错: "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"
-        result = self._fix_tool_pairing(result)
-
+        input_tokens = self.estimate_tokens(msgs)
+        compact_line = int(self.max_input_tokens * self.compact_input_pct / 100)
+        if input_tokens < compact_line:
+            return msgs  # 零触碰：前缀稳定，缓存全命中
+        # 一次性 compact（这一次请求全量重建缓存，之后恢复命中）
+        result = self.compact(msgs, keep_recent=self.compact_keep_recent)
+        # 硬兜底：compact 后仍超 max_input_tokens → system + 最近 3 条
+        if len(result) > 4 and self.estimate_tokens(result) >= self.max_input_tokens:
+            result = self._fix_tool_pairing([result[0]] + result[-3:])
         return result
+
+    def finalize_tool_result(self, text: str) -> str:
+        """tool result 写入 ctx 前的定长压缩 — 只在写入时执行一次。
+
+        写入后该消息字节永不改变（历史 append-only），这是前缀缓存稳定的关键。
+        旧实现每步 govern() 都原地压缩历史消息，导致缓存前缀逐步失效。
+        """
+        return self._compress_result(text)
 
     @staticmethod
     def _fix_tool_pairing(msgs: list) -> list:
@@ -659,7 +628,9 @@ class AgentConfig:
     checkpoint_interval: int = 5     # 每 N 步自动保存检查点
     retry_max: int = 5               # 瞬态错误重试次数（增强长时运行韧性）
     retry_base_delay: float = 2.0    # 指数退避基础延迟（秒）
-    compact_threshold: int = 60      # 上下文消息数超过此值时触发压缩
+    compact_threshold: int = 0       # [已废弃] 旧的按消息条数触发；压缩现由 compact_input_pct 预算驱动
+    compact_input_pct: int = 85      # 输入 token 达 max_input_tokens 的此百分比时触发 compact
+    compact_keep_recent: int = 12    # compact 时保留的最近消息条数
     memory_dir: str = ""
     sessions_dir: str = ""
     skills_dir: str = ""
@@ -795,7 +766,9 @@ class CortexAgent:
                                compress_tail=self.config.compress_tail,
                                safety_margin=self.config.safety_margin,
                                input_warn_pct=self.config.input_warn_pct,
-                               input_force_pct=self.config.input_force_pct)
+                               input_force_pct=self.config.input_force_pct,
+                               compact_input_pct=self.config.compact_input_pct,
+                               compact_keep_recent=self.config.compact_keep_recent)
 
     def _load_kb(self) -> str:
         """加载项目知识库 CORTEX.md。"""
@@ -988,11 +961,11 @@ class CortexAgent:
                 if self._term:
                     self._term._w(f"\n  {self._term.GRAY}[检查点已保存]{self._term.RESET}\n")
 
-            # 上下文压缩
-            if len(self._ctx) > self.config.compact_threshold:
-                self._ctx = self.governor.compact(self._ctx, keep_recent=12)
-                if self._term:
-                    self._term._w(f"  {self._term.GRAY}[上下文已压缩: {len(self._ctx)}条]{self._term.RESET}\n")
+            # 上下文压缩（token 预算驱动；低于预算时 govern 零触碰）
+            _before = len(self._ctx)
+            self._ctx = self.governor.govern(self._ctx)
+            if self._term and len(self._ctx) < _before:
+                self._term._w(f"  {self._term.GRAY}[上下文已压缩: {_before}→{len(self._ctx)}条]{self._term.RESET}\n")
 
             # 读取 TASKS.md 进度，注入进度感知的续行提示
             cont_content = self._build_continuation_prompt()
@@ -1231,7 +1204,12 @@ class CortexAgent:
                 cs = self.cache_stats
                 cache_str = f" | 缓存 {cs['hit_rate']:.0f}%" if cs["calls"] > 0 else ""
                 self._term._w(f"\n  {self._term.GRAY}[心跳] 步骤 {step_no} | 耗时 {elapsed:.0f}s | 上下文 {ctx_pct}%{cache_str} | 消息 {len(self._ctx)} 条 | 工具调用 {len(trace.steps)} 次{self._term.RESET}\n")
+            # govern: 低于 token 预算时零触碰（append-only，前缀缓存全命中）；
+            # 达到预算才一次性 compact
+            _before = len(self._ctx)
             self._ctx = self.governor.govern(self._ctx)
+            if self._term and len(self._ctx) < _before:
+                self._term._w(f"\n  {self._term.GRAY}[上下文已压缩: {_before}→{len(self._ctx)}条]{self._term.RESET}\n")
             content, tool_calls = self._think()
             if content is None and not tool_calls:
                 err = self._last_llm_error or "未知错误"
@@ -1341,18 +1319,15 @@ class CortexAgent:
                 self.observer.record(trace, step_no, name, args, result, ok, cap_str, latency)
                 if self._term:
                     self._term.tool_done(ok, latency, result)
-                self._ctx.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                # 写入时定长压缩（一次性；写入后字节不变 → 前缀缓存稳定）
+                self._ctx.append({"role": "tool", "tool_call_id": tc["id"],
+                                  "content": self.governor.finalize_tool_result(result)})
             # ── Checkpoint: 每 N 步自动保存 ──
             if (self.config.checkpoint_interval > 0 and
                 step_no % self.config.checkpoint_interval == 0 and
                 self._session_id and self.sessions):
                 self._auto_save()
-            # ── Context compaction: 消息数超阈值时压缩 ──
-            if (self.config.compact_threshold > 0 and
-                len(self._ctx) > self.config.compact_threshold):
-                self._ctx = self.governor.compact(self._ctx, keep_recent=12)
-                if self._term:
-                    self._term._w(f"\n  {self._term.GRAY}[上下文已压缩: {len(self._ctx)}条]{self._term.RESET}\n")
+            # 上下文压缩由循环头部的 govern() 按 token 预算统一触发（不再按条数）
             # ── Reflect: 仅在有步数限制时检查收敛 ──
             if not unlimited:
                 result = self._reflect(trace, step_no, max_steps)
@@ -1489,7 +1464,7 @@ class CortexAgent:
 
         # ── Level 3: 压缩上下文后重试（减少输入 token 压力） ──
         time.sleep(0.5)
-        compressed_ctx = self.governor.govern(list(self._ctx))  # 强制再压缩一轮
+        compressed_ctx = self.governor.compact(list(self._ctx), keep_recent=8)  # 强制压缩一轮
         try:
             text, tcs, reasoning, finish_reason = _do_call(thinking=False, ctx_override=compressed_ctx)
             if text or tcs:

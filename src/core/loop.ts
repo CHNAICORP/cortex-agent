@@ -120,6 +120,11 @@ export class ContextGovernor {
   /** 输入 token 预警线（占 maxInputTokens 的百分比） */
   static INPUT_WARN_PCT = 80;
   static INPUT_FORCE_PCT = 90;
+  /** 缓存友好的 compact 触发（token 预算驱动，替代旧的条数触发）：
+   * 输入 token 达 maxInputTokens × COMPACT_INPUT_PCT% 才一次性 compact；
+   * 平时 govern() 零触碰历史（append-only，前缀逐字节稳定 → 缓存全命中） */
+  static COMPACT_INPUT_PCT = 85;
+  static COMPACT_KEEP_RECENT = 12;
 
   system: Message;
   maxMsgs: number;
@@ -133,6 +138,8 @@ export class ContextGovernor {
   safetyMargin: number;
   inputWarnPct: number;
   inputForcePct: number;
+  compactInputPct: number;
+  compactKeepRecent: number;
 
   constructor(opts: {
     system?: string; workDir?: string; maxMsgs?: number;
@@ -141,6 +148,7 @@ export class ContextGovernor {
     maxInputTokens?: number; maxTokens?: number;
     compressThreshold?: number; compressHead?: number; compressTail?: number;
     safetyMargin?: number; inputWarnPct?: number; inputForcePct?: number;
+    compactInputPct?: number; compactKeepRecent?: number;
   }) {
     const parts: string[] = [opts.system || DEFAULT_SYSTEM];
     if (opts.kbContext) parts.push(`\n[项目知识库]\n${opts.kbContext}`);
@@ -158,6 +166,8 @@ export class ContextGovernor {
     this.safetyMargin = opts.safetyMargin || ContextGovernor.SAFETY_MARGIN;
     this.inputWarnPct = opts.inputWarnPct || ContextGovernor.INPUT_WARN_PCT;
     this.inputForcePct = opts.inputForcePct || ContextGovernor.INPUT_FORCE_PCT;
+    this.compactInputPct = opts.compactInputPct || ContextGovernor.COMPACT_INPUT_PCT;
+    this.compactKeepRecent = opts.compactKeepRecent || ContextGovernor.COMPACT_KEEP_RECENT;
     // maxInputTokens: 0 = 自动计算 (contextLimit - maxTokens - SAFETY_MARGIN)
     if (opts.maxInputTokens && opts.maxInputTokens > 0) {
       this.maxInputTokens = opts.maxInputTokens;
@@ -289,88 +299,40 @@ export class ContextGovernor {
   }
 
   /**
-   * 三重裁剪：条数裁剪 + tool result 压缩 + 输入 token 体积管控。
+   * 缓存友好的上下文治理 — 前缀稳定优先（append-only）。
    *
-   * 裁剪策略（与 Python 对齐）:
-   *   1. 按条数裁剪到 maxMsgs，保留最近一轮 tool_call+result 配对
-   *   2. 遍历保留的消息，对超长 tool result 执行首尾压缩
-   *   3. 输入 token 三级预警:
-   *      ≥80% maxInputTokens → 压缩所有 tool result
-   *      ≥90% maxInputTokens → 丢弃最早的非 system 消息
-   *      ≥100% maxInputTokens → 只保留 system + 最近 3 条
+   * 设计原则（对齐 Claude Code / zcode 的 prompt-cache 优化）:
+   *   - 低于压缩预算时**零触碰**：不裁剪条数、不改写历史 tool result、
+   *     不往历史中间插入标记消息，保证请求前缀逐字节稳定，
+   *     最大化 provider 前缀缓存命中率（GLM/DeepSeek/OpenAI 为自动前缀缓存，
+   *     Anthropic 走 cache_control 断点缓存）
+   *   - 达到 token 预算（compactInputPct% × maxInputTokens）才一次性 compact，
+   *     接受这一次全量缓存重建，之后继续全命中
+   *   - compact 后仍超硬上限时，兜底只保留 system + 最近 3 条
    */
   govern(msgs: Message[]): Message[] {
-    // Step 1: 条数裁剪
-    let result: Message[];
-    if (msgs.length <= this.maxMsgs) {
-      result = [...msgs];
-    } else {
-      let limit = this.maxMsgs - 1;
-      let reserve = new Set<number>();
-      let hasPair = false;
-      for (let i = msgs.length - 1; i > 1; i--) {
-        if (msgs[i].role === "tool" && msgs[i - 1].tool_calls) {
-          reserve = new Set([i - 1, i]);
-          hasPair = true;
-          limit -= 2;
-          break;
-        }
-      }
-      const kept: Message[] = [];
-      for (let i = msgs.length - 1; i > 0 && kept.length < Math.max(limit, 0); i--) {
-        if (reserve.has(i)) continue;
-        kept.unshift(msgs[i]);
-      }
-      if (hasPair) {
-        const sorted = [...reserve].sort((a, b) => a - b);
-        kept.push(msgs[sorted[0]]);
-        kept.push(msgs[sorted[1]]);
-      }
-      const trimmed = msgs.length - 1 - kept.length;
-      if (trimmed > 0) {
-        kept.unshift({ role: "system", content: `[${trimmed}条历史已压缩]` });
-        while (kept.length > this.maxMsgs - 1) kept.splice(1, 1);
-      }
-      if (kept.length === 0) kept.push(msgs[msgs.length - 1]);
-      result = [msgs[0], ...kept];
+    const inputTokens = ContextGovernor.estimateTokens(msgs);
+    const compactLine = Math.floor(this.maxInputTokens * this.compactInputPct / 100);
+    if (inputTokens < compactLine) {
+      return msgs;  // 零触碰：前缀稳定，缓存全命中
     }
-
-    // Step 2: 压缩超长 tool result
-    for (const m of result) {
-      if (m.role === "tool" && typeof m.content === "string" && m.content.length > this.compressThreshold) {
-        m.content = this.compressResult(m.content);
-      }
+    // 一次性 compact（这一次请求全量重建缓存，之后恢复命中）
+    let result = this.compact(msgs, this.compactKeepRecent);
+    // 硬兜底：compact 后仍超 maxInputTokens → system + 最近 3 条
+    if (result.length > 4 && ContextGovernor.estimateTokens(result) >= this.maxInputTokens) {
+      result = ContextGovernor._fixToolPairing([result[0], ...result.slice(-3)]);
     }
-
-    // Step 3: 输入 token 体积管控（三级预警）
-    const inputTokens = ContextGovernor.estimateTokens(result);
-    const warnThreshold = Math.floor(this.maxInputTokens * this.inputWarnPct / 100);
-    const forceThreshold = Math.floor(this.maxInputTokens * this.inputForcePct / 100);
-
-    if (inputTokens >= this.maxInputTokens) {
-      // HARD: 只保留 system + 最近 3 条
-      if (result.length > 4) {
-        result = [result[0], ...result.slice(-3)];
-      }
-    } else if (inputTokens >= forceThreshold) {
-      // FORCE: 逐步丢弃最早的非 system 消息
-      while (result.length > 4 && ContextGovernor.estimateTokens(result) >= forceThreshold) {
-        result.splice(1, 1);
-      }
-      result.splice(1, 0, { role: "system", content: "[上下文压力过高，已强制裁剪历史]" });
-    } else if (inputTokens >= warnThreshold) {
-      // WARN: 强制压缩所有 tool result（包括未超阈值的）
-      for (const m of result) {
-        if (m.role === "tool" && typeof m.content === "string" && m.content.length > 200) {
-          m.content = this.compressResult(m.content);
-        }
-      }
-    }
-
-    // Step 4: 修复 tool_calls/tool 配对完整性
-    result = ContextGovernor._fixToolPairing(result);
-
     return result;
+  }
+
+  /**
+   * tool result 写入 ctx 前的定长压缩 — 只在写入时执行一次。
+   *
+   * 写入后该消息字节永不改变（历史 append-only），这是前缀缓存稳定的关键。
+   * 旧实现每步 govern() 都原地压缩历史消息，导致缓存前缀逐步失效。
+   */
+  finalizeToolResult(text: string): string {
+    return this.compressResult(text);
   }
 
   /** 修复 tool_calls/tool 配对完整性 — 裁剪可能打破配对关系导致 API 报错。 */
@@ -661,6 +623,8 @@ this._skillMgr = new SkillManager(this.config.workDir);
       safetyMargin: this.config.safetyMargin,
       inputWarnPct: this.config.inputWarnPct,
       inputForcePct: this.config.inputForcePct,
+      compactInputPct: this.config.compactInputPct,
+      compactKeepRecent: this.config.compactKeepRecent,
     });
   }
 
@@ -859,12 +823,11 @@ this._skillMgr = new SkillManager(this.config.workDir);
         }
       }
 
-      // 上下文压缩
-      if (this.ctx.length > this.config.compactThreshold) {
-        this.ctx = this.governor.compact(this.ctx, 12);
-        if (this.term) {
-          this.term.write(`  \x1b[90m[上下文已压缩: ${this.ctx.length}条]\x1b[0m\n`);
-        }
+      // 上下文压缩（token 预算驱动；低于预算时 govern 零触碰）
+      const beforeLen = this.ctx.length;
+      this.ctx = this.governor.govern(this.ctx);
+      if (this.term && this.ctx.length < beforeLen) {
+        this.term.write(`  \x1b[90m[上下文已压缩: ${beforeLen}→${this.ctx.length}条]\x1b[0m\n`);
       }
 
       // 注入进度感知的续行提示
@@ -1072,7 +1035,13 @@ this._skillMgr = new SkillManager(this.config.workDir);
         const cacheStr = cs.calls > 0 ? ` | 缓存 ${cs.hitRate.toFixed(0)}%` : "";
         this.term.write(`\n  \x1b[90m[心跳] 步骤 ${stepNo} | 耗时 ${elapsed.toFixed(0)}s | 上下文 ${ctxPct}%${cacheStr} | 消息 ${this.ctx.length} 条 | 工具调用 ${this.trace.steps.length} 次\x1b[0m\n`);
       }
+      // govern: 低于 token 预算时零触碰（append-only，前缀缓存全命中）；
+      // 达到预算才一次性 compact
+      const beforeLen = this.ctx.length;
       this.ctx = this.governor.govern(this.ctx);
+      if (this.term && this.ctx.length < beforeLen) {
+        this.term.write(`\n  \x1b[90m[上下文已压缩: ${beforeLen}→${this.ctx.length}条]\x1b[0m\n`);
+      }
       const { text, toolCalls } = await this._think();
       if (text === null && !toolCalls) {
         const err = this.lastLlmError || "未知错误";
@@ -1198,7 +1167,8 @@ this._skillMgr = new SkillManager(this.config.workDir);
         const latency = Date.now() - t0;
         if (this.term) this.term.toolDone(ok, latency, result);
         this.observer.record(this.trace, stepNo, tc.name, tc.args, result, ok, capStr, latency);
-        this.ctx.push({ role: "tool", tool_call_id: tc.id, content: result });
+        // 写入时定长压缩（一次性；写入后字节不变 → 前缀缓存稳定）
+        this.ctx.push({ role: "tool", tool_call_id: tc.id, content: this.governor.finalizeToolResult(result) });
       }
 
       // ── Checkpoint: auto-save every N steps ──
@@ -1207,14 +1177,7 @@ this._skillMgr = new SkillManager(this.config.workDir);
         this.sessionId && this._sessions) {
         this._autoSave();
       }
-      // ── Context compaction: compress when messages exceed threshold ──
-      if (this.config.compactThreshold > 0 &&
-        this.ctx.length > this.config.compactThreshold) {
-        this.ctx = this.governor.compact(this.ctx, 12);
-        if (this.term) {
-          this.term.write(`\n  \x1b[90m[上下文已压缩: ${this.ctx.length}条]\x1b[0m\n`);
-        }
-      }
+      // 上下文压缩由循环头部的 govern() 按 token 预算统一触发（不再按条数）
 
       // ── Reflect: only check convergence when step limit is set ──
       if (!unlimited) {
@@ -1351,7 +1314,7 @@ this._skillMgr = new SkillManager(this.config.workDir);
 
     // ── Level 3: 压缩上下文后重试（减少输入 token 压力） ──
     await new Promise(r => setTimeout(r, 500));
-    const compressedCtx = this.governor.govern([...this.ctx]);
+    const compressedCtx = this.governor.compact([...this.ctx], 8);  // 强制压缩一轮
     try {
       const { text, toolCalls } = await doCall(false, compressedCtx);
       if (text || toolCalls) {

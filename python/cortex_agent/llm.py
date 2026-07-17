@@ -161,6 +161,8 @@ class LLMProvider:
     _provider_name = None
     # Anthropic API 版本
     ANTHROPIC_VERSION = "2023-06-01"
+    # Anthropic prompt cache TTL：None=默认 5 分钟；"1h"=1 小时（写缓存费用更高）
+    ANTHROPIC_CACHE_TTL: Optional[str] = None
 
     @classmethod
     def setup(cls, providers: dict = None, active: str = None):
@@ -238,6 +240,7 @@ class LLMProvider:
         self._cache_hits: int = 0
         self._total_input_tokens: int = 0
         self._total_cached_tokens: int = 0
+        self._total_cache_write_tokens: int = 0  # Anthropic cache_creation
 
     @property
     def cache_stats(self) -> dict:
@@ -250,7 +253,37 @@ class LLMProvider:
             "hit_rate": rate,
             "total_input_tokens": self._total_input_tokens,
             "total_cached_tokens": self._total_cached_tokens,
+            "total_cache_write_tokens": self._total_cache_write_tokens,
         }
+
+    @staticmethod
+    def _extract_cached_tokens(usage) -> int:
+        """从 OpenAI 兼容 usage 中提取缓存命中 token 数（兼容多家字段）。
+
+        各 provider 字段差异:
+          - OpenAI:   usage.prompt_tokens_details.cached_tokens
+          - DeepSeek: usage.prompt_cache_hit_tokens（顶层字段）
+          - GLM:      usage.prompt_tokens_details.cached_tokens 或顶层兼容字段
+        """
+        if usage is None:
+            return 0
+        def _get(obj, name):
+            if obj is None:
+                return 0
+            if isinstance(obj, dict):
+                return obj.get(name, 0) or 0
+            return getattr(obj, name, 0) or 0
+        # DeepSeek 顶层字段
+        v = _get(usage, "prompt_cache_hit_tokens")
+        if v:
+            return int(v)
+        # OpenAI / GLM 嵌套字段
+        details = _get(usage, "prompt_tokens_details")
+        v = _get(details, "cached_tokens")
+        if v:
+            return int(v)
+        # 其他兼容顶层字段
+        return int(_get(usage, "cached_tokens"))
 
     def _track_usage(self, resp):
         """从 API 响应中提取 usage 信息更新缓存统计。"""
@@ -259,12 +292,10 @@ class LLMProvider:
             if usage:
                 self._call_count += 1
                 self._total_input_tokens += getattr(usage, 'prompt_tokens', 0) or 0
-                cached = getattr(usage, 'prompt_tokens_details', None)
-                if cached:
-                    ct = getattr(cached, 'cached_tokens', 0) or 0
+                ct = self._extract_cached_tokens(usage)
+                if ct > 0:
                     self._total_cached_tokens += ct
-                    if ct > 0:
-                        self._cache_hits += 1
+                    self._cache_hits += 1
         except Exception:
             self._call_count += 1  # 至少计数
 
@@ -291,8 +322,20 @@ class LLMProvider:
     # Anthropic Messages API 转换层
     # ══════════════════════════════════════════════════════════════
 
+    @classmethod
+    def _cache_control(cls) -> Dict:
+        """Anthropic prompt cache 断点标记（ephemeral；可选 1h TTL）。"""
+        cc: Dict = {"type": "ephemeral"}
+        if cls.ANTHROPIC_CACHE_TTL:
+            cc["ttl"] = cls.ANTHROPIC_CACHE_TTL
+        return cc
+
     def _convert_tools_to_anthropic(self) -> List[Dict]:
-        """将 OpenAI function-calling 格式的 tools 转为 Anthropic tools 格式。"""
+        """将 OpenAI function-calling 格式的 tools 转为 Anthropic tools 格式。
+
+        在最后一个 tool 上放置 cache_control 断点：tools 定义是稳定静态前缀，
+        缓存后每轮请求无需为 system+tools 前缀重复计费。
+        """
         result = []
         for tool in self.tools:
             if tool.get("type") == "function":
@@ -302,7 +345,26 @@ class LLMProvider:
                     "description": fn.get("description", ""),
                     "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
                 })
+        if result:
+            result[-1]["cache_control"] = self._cache_control()
         return result
+
+    def _mark_tail_breakpoint(self, anthropic_msgs: List[Dict]) -> None:
+        """在最后一条消息的末尾内容块放置移动缓存断点（原地修改转换后的副本）。
+
+        断点随对话尾部前移：本轮请求命中此前写入的缓存前缀，
+        并把最新增量写入缓存，供下一轮命中。最多占用 4 个断点中的 3 个
+        （system + tools + 尾部消息）。
+        """
+        if not anthropic_msgs:
+            return
+        last = anthropic_msgs[-1]
+        content = last.get("content")
+        if isinstance(content, str):
+            last["content"] = [{"type": "text", "text": content,
+                                "cache_control": self._cache_control()}]
+        elif isinstance(content, list) and content and isinstance(content[-1], dict):
+            content[-1]["cache_control"] = self._cache_control()
 
     def _convert_messages_to_anthropic(self, messages: List[Dict]) -> Tuple[str, List[Dict]]:
         """将 OpenAI 消息格式转为 Anthropic Messages API 格式。
@@ -400,12 +462,14 @@ class LLMProvider:
         reasoning = "".join(reasoning_parts) if reasoning_parts else None
         tcs = tool_calls if tool_calls else None
 
-        # 更新缓存统计
+        # 更新缓存统计（Anthropic: input_tokens 不含缓存读/写部分，分母需全部计入）
         self._call_count += 1
         usage = data.get("usage", {})
-        self._total_input_tokens += usage.get("input_tokens", 0)
         cached = usage.get("cache_read_input_tokens", 0)
+        created = usage.get("cache_creation_input_tokens", 0)
+        self._total_input_tokens += usage.get("input_tokens", 0) + cached + created
         self._total_cached_tokens += cached
+        self._total_cache_write_tokens += created
         if cached > 0:
             self._cache_hits += 1
 
@@ -415,13 +479,16 @@ class LLMProvider:
                         ) -> Tuple[str, Optional[List[Dict]], Optional[str], str]:
         """Anthropic Messages API 非流式调用。"""
         system, anthropic_msgs = self._convert_messages_to_anthropic(messages)
+        self._mark_tail_breakpoint(anthropic_msgs)
         body: Dict = {
             "model": self.model,
             "max_tokens": self.max_tokens,
             "messages": anthropic_msgs,
         }
         if system:
-            body["system"] = system
+            # system 以 block 形式携带 cache_control 断点（静态前缀缓存）
+            body["system"] = [{"type": "text", "text": system,
+                               "cache_control": self._cache_control()}]
         if self.tools:
             body["tools"] = self._convert_tools_to_anthropic()
         if thinking:
@@ -452,6 +519,7 @@ class LLMProvider:
           message_start → content_block_start → content_block_delta(s) → content_block_stop → ... → message_delta → message_stop
         """
         system, anthropic_msgs = self._convert_messages_to_anthropic(messages)
+        self._mark_tail_breakpoint(anthropic_msgs)
         body: Dict = {
             "model": self.model,
             "max_tokens": self.max_tokens,
@@ -459,7 +527,9 @@ class LLMProvider:
             "stream": True,
         }
         if system:
-            body["system"] = system
+            # system 以 block 形式携带 cache_control 断点（静态前缀缓存）
+            body["system"] = [{"type": "text", "text": system,
+                               "cache_control": self._cache_control()}]
         if self.tools:
             body["tools"] = self._convert_tools_to_anthropic()
         if thinking:
@@ -485,6 +555,7 @@ class LLMProvider:
         current_block_idx = -1
         anthropic_input_tokens = 0
         anthropic_cached_tokens = 0
+        anthropic_cache_write = 0
 
         for line in resp.iter_lines():
             if not line:
@@ -548,6 +619,7 @@ class LLMProvider:
                 usage = msg_obj.get("usage", {}) or evt.get("usage", {})
                 anthropic_input_tokens = usage.get("input_tokens", 0)
                 anthropic_cached_tokens = usage.get("cache_read_input_tokens", 0)
+                anthropic_cache_write = usage.get("cache_creation_input_tokens", 0)
 
             elif etype == "message_delta":
                 delta = evt.get("delta", {})
@@ -559,6 +631,8 @@ class LLMProvider:
                     anthropic_input_tokens = usage["input_tokens"]
                 if usage.get("cache_read_input_tokens"):
                     anthropic_cached_tokens = usage["cache_read_input_tokens"]
+                if usage.get("cache_creation_input_tokens"):
+                    anthropic_cache_write = usage["cache_creation_input_tokens"]
 
             elif etype == "message_stop":
                 break
@@ -577,10 +651,14 @@ class LLMProvider:
                 tcs.append({"id": tb["id"], "name": tb["name"], "args": args})
 
         # 更新缓存统计：使用 Anthropic 流式返回的实际 token 数
+        # （input_tokens 不含缓存读/写部分，分母需全部计入）
         self._call_count += 1
         if anthropic_input_tokens > 0:
-            self._total_input_tokens += anthropic_input_tokens
+            self._total_input_tokens += (anthropic_input_tokens
+                                         + anthropic_cached_tokens
+                                         + anthropic_cache_write)
             self._total_cached_tokens += anthropic_cached_tokens
+            self._total_cache_write_tokens += anthropic_cache_write
             if anthropic_cached_tokens > 0:
                 self._cache_hits += 1
         else:
@@ -640,6 +718,9 @@ class LLMProvider:
             "model": self.model, "messages": messages,
             "tools": self.tools, "max_tokens": self.max_tokens,
             "stream": True,
+            # 要求流式响应回传 usage（OpenAI/DeepSeek/GLM 均支持），
+            # 否则无法统计 prompt_tokens 与缓存命中
+            "stream_options": {"include_usage": True},
         }
         kwargs.update(self._thinking_kwargs(thinking))
         resp = self.client.chat.completions.create(**kwargs)
@@ -692,12 +773,10 @@ class LLMProvider:
         self._call_count += 1
         if stream_usage:
             self._total_input_tokens += getattr(stream_usage, 'prompt_tokens', 0) or 0
-            cached_details = getattr(stream_usage, 'prompt_tokens_details', None)
-            if cached_details:
-                ct = getattr(cached_details, 'cached_tokens', 0) or 0
+            ct = self._extract_cached_tokens(stream_usage)
+            if ct > 0:
                 self._total_cached_tokens += ct
-                if ct > 0:
-                    self._cache_hits += 1
+                self._cache_hits += 1
         else:
             total_chars = sum(len(m.get("content", "") or "") for m in messages)
             self._total_input_tokens += int(total_chars * 0.4)

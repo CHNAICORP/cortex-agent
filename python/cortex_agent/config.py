@@ -148,6 +148,8 @@ def load_settings(project_dir: str = None) -> dict:
             "safety_margin": 4096,
             "input_warn_pct": 80,
             "input_force_pct": 90,
+            "compact_input_pct": 85,
+            "compact_keep_recent": 12,
             # ── ToolExecutor 可调参数 ──
             "max_result_chars": 10000,
             # ── Memory 注入控制 ──
@@ -204,7 +206,8 @@ def apply_to_config(config, settings: dict):
                 "safety_margin", "input_warn_pct", "input_force_pct",
                 "max_result_chars", "memory_inject_count",
                 "max_rounds", "checkpoint_interval", "retry_max",
-                "retry_base_delay", "compact_threshold"):
+                "retry_base_delay", "compact_threshold",
+                "compact_input_pct", "compact_keep_recent"):
         if key in settings:
             setattr(config, key, settings[key])
 
@@ -270,6 +273,8 @@ def create_default_settings(path: str) -> dict:
         "safety_margin": 4096,
         "input_warn_pct": 80,
         "input_force_pct": 90,
+        "compact_input_pct": 85,
+        "compact_keep_recent": 12,
         # ── ToolExecutor 可调参数 ──
         "max_result_chars": 10000,
         # ── Memory 注入控制 ──
@@ -376,6 +381,8 @@ def create_default_settings(path: str) -> dict:
   "safety_margin": 4096,                      // 输入 Token 安全余量
   "input_warn_pct": 80,                       // 超过此百分比发出警告
   "input_force_pct": 90,                      // 超过此百分比强制压缩
+  "compact_input_pct": 85,                    // 输入 token 达此百分比时触发 compact（缓存友好：平时零触碰历史）
+  "compact_keep_recent": 12,                  // compact 时保留的最近消息条数
   
   // ── 工具执行 ──
   "max_result_chars": 2000,                   // 工具输出最大字符数（超过截断）

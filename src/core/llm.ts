@@ -178,6 +178,19 @@ export function resolveCapabilities(model: string): ModelCaps {
 let activeProvider = "deepseek";
 let activeBaseUrl = "https://api.deepseek.com/v1";
 const ANTHROPIC_VERSION = "2023-06-01";
+// Anthropic prompt cache TTL：null=默认 5 分钟；"1h"=1 小时（写缓存费用更高）
+let anthropicCacheTtl: string | null = null;
+
+export function setAnthropicCacheTtl(ttl: string | null): void {
+  anthropicCacheTtl = ttl;
+}
+
+/** Anthropic prompt cache 断点标记（ephemeral；可选 1h TTL）。 */
+function anthropicCacheControl(): Record<string, unknown> {
+  const cc: Record<string, unknown> = { type: "ephemeral" };
+  if (anthropicCacheTtl) cc.ttl = anthropicCacheTtl;
+  return cc;
+}
 
 export function setupProviders(providers?: Record<string, ProviderCfg>, active?: string) {
   if (providers) Object.assign(DEFAULT_PROVIDERS, providers);
@@ -228,6 +241,7 @@ export class LLMProvider {
   private cacheHits = 0;
   private totalInputTokens = 0;
   private totalCachedTokens = 0;
+  private totalCacheWriteTokens = 0;  // Anthropic cache_creation
 
   constructor(config: LLMConfig) {
     this.apiKey = config.apiKey;
@@ -246,7 +260,22 @@ export class LLMProvider {
       hitRate: this.totalInputTokens > 0 ? (this.totalCachedTokens / this.totalInputTokens) * 100 : 0,
       totalInputTokens: this.totalInputTokens,
       totalCachedTokens: this.totalCachedTokens,
+      totalCacheWriteTokens: this.totalCacheWriteTokens,
     };
+  }
+
+  /** 从 OpenAI 兼容 usage 中提取缓存命中 token 数（兼容多家字段）。
+   *   - OpenAI:   usage.prompt_tokens_details.cached_tokens
+   *   - DeepSeek: usage.prompt_cache_hit_tokens（顶层字段）
+   *   - GLM:      usage.prompt_tokens_details.cached_tokens 或顶层兼容字段
+   */
+  static extractCachedTokens(usage: any): number {
+    if (!usage || typeof usage !== "object") return 0;
+    const hit = usage.prompt_cache_hit_tokens;                  // DeepSeek 顶层字段
+    if (hit) return Math.floor(hit);
+    const nested = usage.prompt_tokens_details?.cached_tokens;  // OpenAI / GLM
+    if (nested) return Math.floor(nested);
+    return Math.floor(usage.cached_tokens || 0);                // 其他兼容顶层字段
   }
 
   // ══════════════════════════════════════════════════════════════
@@ -254,11 +283,29 @@ export class LLMProvider {
   // ══════════════════════════════════════════════════════════════
 
   private _convertToolsToAnthropic(): unknown[] {
-    return this.tools.map(t => ({
+    const result: Array<Record<string, unknown>> = this.tools.map(t => ({
       name: t.function?.name || "",
       description: t.function?.description || "",
       input_schema: t.function?.parameters || { type: "object", properties: {} },
     }));
+    // 在最后一个 tool 上放置 cache_control 断点：tools 定义是稳定静态前缀，
+    // 缓存后每轮请求无需为 system+tools 前缀重复计费
+    if (result.length > 0) result[result.length - 1].cache_control = anthropicCacheControl();
+    return result;
+  }
+
+  /** 在最后一条消息的末尾内容块放置移动缓存断点（原地修改转换后的副本）。
+   * 断点随对话尾部前移：本轮请求命中此前写入的缓存前缀，
+   * 并把最新增量写入缓存，供下一轮命中。 */
+  private _markTailBreakpoint(msgs: Array<Record<string, any>>): void {
+    if (msgs.length === 0) return;
+    const last = msgs[msgs.length - 1];
+    const content = last.content;
+    if (typeof content === "string") {
+      last.content = [{ type: "text", text: content, cache_control: anthropicCacheControl() }];
+    } else if (Array.isArray(content) && content.length > 0) {
+      content[content.length - 1].cache_control = anthropicCacheControl();
+    }
   }
 
   private _convertMessagesToAnthropic(messages: Message[]): { system: string; msgs: unknown[] } {
@@ -339,12 +386,14 @@ export class LLMProvider {
       }
     }
 
-    // 更新缓存统计
+    // 更新缓存统计（Anthropic: input_tokens 不含缓存读/写部分，分母需全部计入）
     this.callCount++;
     const usage = (data.usage as Record<string, number>) || {};
-    this.totalInputTokens += usage.input_tokens || 0;
     const cached = usage.cache_read_input_tokens || 0;
+    const created = usage.cache_creation_input_tokens || 0;
+    this.totalInputTokens += (usage.input_tokens || 0) + cached + created;
     this.totalCachedTokens += cached;
+    this.totalCacheWriteTokens += created;
     if (cached > 0) this.cacheHits++;
 
     return {
@@ -365,12 +414,14 @@ export class LLMProvider {
 
   private async _callAnthropic(messages: Message[], thinking: boolean): Promise<LLMResponse> {
     const { system, msgs } = this._convertMessagesToAnthropic(messages);
+    this._markTailBreakpoint(msgs as Array<Record<string, any>>);
     const body: Record<string, unknown> = {
       model: this.model,
       max_tokens: this.maxTokens,
       messages: msgs,
     };
-    if (system) body.system = system;
+    // system 以 block 形式携带 cache_control 断点（静态前缀缓存）
+    if (system) body.system = [{ type: "text", text: system, cache_control: anthropicCacheControl() }];
     if (this.tools.length > 0) body.tools = this._convertToolsToAnthropic();
     if (thinking) body.thinking = { type: "enabled", budget_tokens: Math.min(this.maxTokens, 16000) };
 
@@ -398,13 +449,15 @@ export class LLMProvider {
     onTool?: (name: string, args: Record<string, unknown>) => void,
   ): Promise<LLMResponse> {
     const { system, msgs } = this._convertMessagesToAnthropic(messages);
+    this._markTailBreakpoint(msgs as Array<Record<string, any>>);
     const body: Record<string, unknown> = {
       model: this.model,
       max_tokens: this.maxTokens,
       messages: msgs,
       stream: true,
     };
-    if (system) body.system = system;
+    // system 以 block 形式携带 cache_control 断点（静态前缀缓存）
+    if (system) body.system = [{ type: "text", text: system, cache_control: anthropicCacheControl() }];
     if (this.tools.length > 0) body.tools = this._convertToolsToAnthropic();
     if (thinking) body.thinking = { type: "enabled", budget_tokens: Math.min(this.maxTokens, 16000) };
 
@@ -432,6 +485,7 @@ export class LLMProvider {
     let currentBlockIdx = -1;
     let anthropicInputTokens = 0;
     let anthropicCachedTokens = 0;
+    let anthropicCacheWrite = 0;
 
     if (!reader) return { text: "", toolCalls: null, reasoning: "", finishReason };
 
@@ -494,6 +548,7 @@ export class LLMProvider {
             const usage = evt.message?.usage || evt.usage || {};
             anthropicInputTokens = (usage.input_tokens as number) || 0;
             anthropicCachedTokens = (usage.cache_read_input_tokens as number) || 0;
+            anthropicCacheWrite = (usage.cache_creation_input_tokens as number) || 0;
           } else if (etype === "message_delta") {
             const delta = evt.delta || {};
             if (delta.stop_reason) finishReason = delta.stop_reason;
@@ -501,6 +556,7 @@ export class LLMProvider {
             const usage = evt.usage || {};
             if (usage.input_tokens) anthropicInputTokens = usage.input_tokens;
             if (usage.cache_read_input_tokens) anthropicCachedTokens = usage.cache_read_input_tokens;
+            if (usage.cache_creation_input_tokens) anthropicCacheWrite = usage.cache_creation_input_tokens;
           } else if (etype === "message_stop") {
             // stream complete
           }
@@ -510,9 +566,11 @@ export class LLMProvider {
 
     this.callCount++;
     // 使用 Anthropic 流式返回的实际 token 数
+    // （input_tokens 不含缓存读/写部分，分母需全部计入）
     if (anthropicInputTokens > 0) {
-      this.totalInputTokens += anthropicInputTokens;
+      this.totalInputTokens += anthropicInputTokens + anthropicCachedTokens + anthropicCacheWrite;
       this.totalCachedTokens += anthropicCachedTokens;
+      this.totalCacheWriteTokens += anthropicCacheWrite;
       if (anthropicCachedTokens > 0) this.cacheHits++;
     } else {
       // fallback：估算
@@ -567,8 +625,7 @@ export class LLMProvider {
     if (data.usage) {
       const usage = data.usage as Record<string, unknown>;
       this.totalInputTokens += (usage.prompt_tokens as number) || 0;
-      const details = usage.prompt_tokens_details as Record<string, unknown> | undefined;
-      const cached = (details?.cached_tokens as number) || 0;
+      const cached = LLMProvider.extractCachedTokens(usage);
       this.totalCachedTokens += cached;
       if (cached > 0) this.cacheHits++;
     }
@@ -608,6 +665,9 @@ export class LLMProvider {
       tools: this.tools.length > 0 ? this.tools : undefined,
       max_tokens: this.maxTokens,
       stream: true,
+      // 要求流式响应回传 usage（OpenAI/DeepSeek/GLM 均支持），
+      // 否则无法统计 prompt_tokens 与缓存命中
+      stream_options: { include_usage: true },
     };
     Object.assign(body, this._thinkingBody(thinking));
 
@@ -717,8 +777,7 @@ export class LLMProvider {
     if (streamUsage) {
       const usage = streamUsage as Record<string, unknown>;
       this.totalInputTokens += (usage.prompt_tokens as number) || 0;
-      const details = usage.prompt_tokens_details as Record<string, unknown> | undefined;
-      const cached = (details?.cached_tokens as number) || 0;
+      const cached = LLMProvider.extractCachedTokens(usage);
       this.totalCachedTokens += cached;
       if (cached > 0) this.cacheHits++;
     } else {

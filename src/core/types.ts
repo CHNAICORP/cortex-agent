@@ -107,6 +107,7 @@ export interface CacheStats {
   hitRate: number;
   totalInputTokens: number;
   totalCachedTokens: number;
+  totalCacheWriteTokens: number;
 }
 
 // ── AgentConfig ──
@@ -149,7 +150,12 @@ export interface AgentConfig {
   checkpointInterval: number;
   retryMax: number;
   retryBaseDelay: number;
+  /** @deprecated 旧的按消息条数触发；压缩现由 compactInputPct 预算驱动 */
   compactThreshold: number;
+  /** 输入 token 达 maxInputTokens 的此百分比时触发 compact（缓存友好） */
+  compactInputPct: number;
+  /** compact 时保留的最近消息条数 */
+  compactKeepRecent: number;
 }
 
 export function defaultWorkDir(): string {
@@ -173,7 +179,9 @@ export const DEFAULT_CONFIG: AgentConfig = {
   checkpointInterval: 5,    // auto-save every N steps
   retryMax: 5,              // transient error retry count (enhanced resilience)
   retryBaseDelay: 2.0,      // exponential backoff base delay (seconds)
-  compactThreshold: 60,     // context compaction trigger
+  compactThreshold: 0,      // [已废弃] 旧的条数触发；压缩现由 compactInputPct 预算驱动
+  compactInputPct: 85,      // 输入 token 达 maxInputTokens 的此百分比时触发 compact
+  compactKeepRecent: 12,    // compact 时保留的最近消息条数
   memoryDir: "",
   sessionsDir: "",
   skillsDir: "",
